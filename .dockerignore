@@ -1,0 +1,17 @@
+.git
+.gitignore
+.gitattributes
+.env
+.env.example
+.claude/
+__pycache__/
+*.pyc
+.venv/
+venv/
+recon.har
+README.md
+CLAUDE.md
+LICENSE
+Dockerfile
+docker-compose.yml
+.dockerignore

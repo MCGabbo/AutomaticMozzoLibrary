@@ -1,0 +1,8 @@
+services:
+  bot:
+    build: .
+    image: autobiblio-bot:latest
+    container_name: autobiblio-bot
+    restart: unless-stopped
+    env_file:
+      - .env

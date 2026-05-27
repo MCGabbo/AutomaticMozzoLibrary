@@ -118,7 +118,38 @@ I bottoni del wizard mostrano solo i giorni e le fasce con posti effettivamente
 liberi. Lo stato del wizard sta in memoria del processo: se il bot riparte,
 basta digitare `/prenota` per ricominciare.
 
-### Deploy su server (systemd)
+### Deploy su server con Docker (consigliato)
+
+Il repo include `Dockerfile` e `docker-compose.yml`. Il container è
+stateless (lo stato del wizard sta in memoria del processo: se il container
+riparte, basta rifare `/prenota` su Telegram).
+
+```bash
+git clone https://github.com/MCGabbo/AutomaticMozzoLibrary.git
+cd AutomaticMozzoLibrary
+cp .env.example .env
+nano .env                   # compila CF, email, telefono, nome, token, chat_id
+docker compose up -d --build
+docker compose logs -f
+```
+
+Aggiornamento:
+```bash
+git pull
+docker compose up -d --build
+```
+
+Stop / riavvio:
+```bash
+docker compose restart
+docker compose down
+```
+
+Il `.env` viene letto a runtime tramite `env_file`, non finisce mai dentro
+l'immagine: l'immagine può essere ricostruita liberamente senza esporre
+segreti.
+
+### Deploy su server con systemd (alternativa senza Docker)
 
 Esempio di unit `/etc/systemd/system/autobiblio-bot.service`:
 
