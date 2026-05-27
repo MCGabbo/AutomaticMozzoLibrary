@@ -164,12 +164,19 @@ def kb_back(target: str) -> list[InlineKeyboardButton]:
 
 # ---------- API wrappers (chiamati da to_thread) ----------
 
-def _giorni_con_disponibilita(session, area_id: int) -> list[tuple[date, dict]]:
+async def _giorni_con_disponibilita(session, area_id: int) -> list[tuple[date, dict]]:
+    """Fetcha i 7 giorni in parallelo. Salta giorni con errore/vuoti."""
     today = datetime.now(TZ).date()
+    days = [today + timedelta(days=off) for off in range(MAX_GIORNI_AVANTI)]
+    results = await asyncio.gather(
+        *(asyncio.to_thread(slot_giorno, session, d, area_id) for d in days),
+        return_exceptions=True,
+    )
     out = []
-    for off in range(MAX_GIORNI_AVANTI):
-        d = today + timedelta(days=off)
-        slots = slot_giorno(session, d, area_id)
+    for d, slots in zip(days, results):
+        if isinstance(slots, Exception):
+            log.warning("slot %s area %s: %s", d, area_id, slots)
+            continue
         if any(s["disponibili"] > 0 for s in slots.values()):
             out.append((d, slots))
     return out
@@ -544,7 +551,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _mostra_giorni(q, context, area_id: int):
     await q.edit_message_text(f"Caricamento giorni disponibili per {nome_sede(area_id)}...")
     session = context.application.bot_data["session"]
-    giorni = await asyncio.to_thread(_giorni_con_disponibilita, session, area_id)
+    giorni = await _giorni_con_disponibilita(session, area_id)
     if not giorni:
         await q.edit_message_text(
             f"Nessun giorno con slot liberi nei prossimi {MAX_GIORNI_AVANTI} giorni.",
@@ -683,9 +690,12 @@ async def _avvia_quick(update: Update, context: ContextTypes.DEFAULT_TYPE, area_
 
 async def _mostra_slot_overview(target, context, edit: bool = False):
     session = context.application.bot_data["session"]
+    # Tutte le 14 GET (2 sedi × 7 giorni) in parallelo
+    sedi_giorni = await asyncio.gather(
+        *(_giorni_con_disponibilita(session, area_id) for area_id, _ in SEDI)
+    )
     righe = []
-    for area_id, nome in SEDI:
-        giorni = await asyncio.to_thread(_giorni_con_disponibilita, session, area_id)
+    for (area_id, nome), giorni in zip(SEDI, sedi_giorni):
         righe.append(f"\n*{nome}*")
         if not giorni:
             righe.append("  (nessuno slot libero)")
