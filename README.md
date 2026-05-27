@@ -122,6 +122,7 @@ viene creato automaticamente al primo avvio.
 | `/cancella_profilo` | Elimina i propri dati dal bot |
 | `/prenota` | Wizard prenotazione: sede → giorno → fascia → conferma |
 | `/domattina` | Scorciatoia: mattina al Piano 1 di domani |
+| `/annulla` | Annulla una prenotazione (solo quelle fatte dal bot) |
 | `/slot` | Disponibilità prossimi 7 giorni su entrambe le sedi |
 
 ### Comandi admin

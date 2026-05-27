@@ -74,6 +74,24 @@ def init_db() -> None:
             )
             """
         )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS prenotazioni (
+                codice TEXT PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                entry_id INTEGER NOT NULL,
+                giorno TEXT NOT NULL,           -- YYYY-MM-DD
+                fascia TEXT NOT NULL,           -- HH:MM-HH:MM
+                area_id INTEGER NOT NULL,
+                postazione TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                cancelled_at TEXT
+            )
+            """
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_prenotazioni_chat ON prenotazioni(chat_id)"
+        )
 
 
 def _conn() -> sqlite3.Connection:
@@ -174,6 +192,79 @@ def list_all() -> list[User]:
         rows = c.execute("SELECT * FROM users ORDER BY created_at DESC").fetchall()
     return [User.from_row(r) for r in rows]
 
+
+# ---------- prenotazioni ----------
+
+@dataclass
+class Prenotazione:
+    codice: str
+    chat_id: int
+    entry_id: int
+    giorno: str
+    fascia: str
+    area_id: int
+    postazione: str | None
+    created_at: str
+    cancelled_at: str | None
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "Prenotazione":
+        return cls(**dict(row))
+
+
+def add_prenotazione(
+    codice: str,
+    chat_id: int,
+    entry_id: int,
+    giorno: str,
+    fascia: str,
+    area_id: int,
+    postazione: str | None,
+) -> None:
+    with _conn() as c:
+        c.execute(
+            """
+            INSERT INTO prenotazioni
+              (codice, chat_id, entry_id, giorno, fascia, area_id, postazione)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(codice) DO NOTHING
+            """,
+            (codice, chat_id, entry_id, giorno, fascia, area_id, postazione),
+        )
+
+
+def list_prenotazioni_attive(chat_id: int, today_iso: str) -> list[Prenotazione]:
+    """Prenotazioni dell'utente non cancellate e da oggi in poi."""
+    with _conn() as c:
+        rows = c.execute(
+            """
+            SELECT * FROM prenotazioni
+            WHERE chat_id = ? AND cancelled_at IS NULL AND giorno >= ?
+            ORDER BY giorno ASC, fascia ASC
+            """,
+            (chat_id, today_iso),
+        ).fetchall()
+    return [Prenotazione.from_row(r) for r in rows]
+
+
+def get_prenotazione(codice: str) -> Prenotazione | None:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT * FROM prenotazioni WHERE codice = ?", (codice,)
+        ).fetchone()
+    return Prenotazione.from_row(row) if row else None
+
+
+def mark_cancelled(codice: str) -> bool:
+    with _conn() as c:
+        cur = c.execute(
+            "UPDATE prenotazioni SET cancelled_at = CURRENT_TIMESTAMP WHERE codice = ? AND cancelled_at IS NULL",
+            (codice,),
+        )
+    return cur.rowcount > 0
+
+
+# ---------- payload utenti ----------
 
 def booking_payload(chat_id: int) -> tuple[dict, str] | None:
     """Estrae (utente_dict, cognome_nome) come servono a book.prenota_e_conferma."""

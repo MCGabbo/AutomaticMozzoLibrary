@@ -1,5 +1,6 @@
 .env
-recon.har
+*.har
+*.stackdump
 __pycache__/
 *.pyc
 .venv/

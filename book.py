@@ -197,6 +197,24 @@ def prenota_e_conferma(
     }
 
 
+def cancella_prenotazione(session: requests.Session, codice: str, cf: str) -> dict:
+    """Cancella una prenotazione via POST /api/entry/delete/{codice}?chiave={cf}.
+
+    Ritorna {'ok': True} oppure {'ok': False, 'errore': str}.
+    """
+    url = f"{BASE}/api/entry/delete/{codice}"
+    r = session.post(url, params={"chiave": cf})
+    if not r.ok:
+        return {"ok": False, "errore": f"delete HTTP {r.status_code}: {r.text[:200]}"}
+    try:
+        data = r.json()
+    except ValueError:
+        return {"ok": False, "errore": f"risposta non-JSON: {r.text[:200]}"}
+    if not data.get("success"):
+        return {"ok": False, "errore": f"il server non ha confermato: {data}"}
+    return {"ok": True}
+
+
 def utente_da_env() -> tuple[dict, str]:
     """Estrae utente e cognome_nome dalle variabili d'ambiente (.env già caricato)."""
     utente = {

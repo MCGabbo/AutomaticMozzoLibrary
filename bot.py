@@ -45,6 +45,7 @@ import users
 from book import (
     TZ,
     build_session,
+    cancella_prenotazione,
     prenota_e_conferma,
     slot_giorno,
 )
@@ -149,6 +150,7 @@ def kb_home() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⚡ Domattina, Piano 1", callback_data="quick:domattina-piano1")],
         [InlineKeyboardButton("📅 Nuova prenotazione", callback_data="wiz:sede")],
         [InlineKeyboardButton("🔍 Slot disponibili", callback_data="slot:home")],
+        [InlineKeyboardButton("🗑️ Annulla prenotazione", callback_data="cancel:lista")],
     ])
 
 
@@ -225,6 +227,32 @@ async def cmd_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await guard(update, context):
         return
     await _mostra_slot_overview(update.message, context)
+
+
+async def cmd_annulla(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await guard(update, context):
+        return
+    chat_id = update.effective_chat.id
+    today_iso = datetime.now(TZ).date().isoformat()
+    prenotazioni = users.list_prenotazioni_attive(chat_id, today_iso)
+    if not prenotazioni:
+        await update.message.reply_text(
+            "Non hai prenotazioni attive memorizzate dal bot.\n\n"
+            "Nota: vengono mostrate solo le prenotazioni create attraverso questo bot."
+        )
+        return
+    rows = []
+    for p in prenotazioni:
+        giorno_d = date.fromisoformat(p.giorno)
+        rows.append([InlineKeyboardButton(
+            f"{label_giorno(giorno_d)} {p.fascia}  {nome_sede(p.area_id)}",
+            callback_data=f"cancel:pick:{p.codice}",
+        )])
+    rows.append([InlineKeyboardButton("⬅️ Home", callback_data="home")])
+    await update.message.reply_text(
+        "Quale prenotazione vuoi annullare?",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
 
 
 async def cmd_profilo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -543,6 +571,20 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _mostra_slot_overview(q.message, context, edit=True)
         return
 
+    if data == "cancel:lista":
+        await _mostra_cancella_lista(q, context)
+        return
+
+    if data.startswith("cancel:pick:"):
+        codice = data.split(":", 2)[2]
+        await _mostra_cancella_riepilogo(q, context, codice)
+        return
+
+    if data.startswith("cancel:confirm:"):
+        codice = data.split(":", 2)[2]
+        await _esegui_cancellazione(q, context, codice)
+        return
+
     log.warning("Callback data sconosciuta: %r", data)
 
 
@@ -636,6 +678,19 @@ async def _esegui_prenotazione(q, context):
     if not res["ok"]:
         await q.edit_message_text(f"❌ Errore: {res['errore']}", reply_markup=kb_home())
         return
+    # Memorizza la prenotazione per consentire la cancellazione successiva
+    try:
+        users.add_prenotazione(
+            codice=res["codice"],
+            chat_id=q.from_user.id,
+            entry_id=res["entry"],
+            giorno=giorno.isoformat(),
+            fascia=res["slot"],
+            area_id=area_id,
+            postazione=res.get("postazione"),
+        )
+    except Exception as e:
+        log.warning("add_prenotazione fallito (proseguo): %s", e)
     testo = (
         "✅ Prenotazione confermata.\n\n"
         f"📍 {nome_sede(area_id)}\n"
@@ -684,6 +739,101 @@ async def _avvia_quick(update: Update, context: ContextTypes.DEFAULT_TYPE, area_
         await update.callback_query.edit_message_text(testo, reply_markup=markup)
     else:
         await update.message.reply_text(testo, reply_markup=markup)
+
+
+# ---------- wizard cancellazione ----------
+
+async def _mostra_cancella_lista(q, context):
+    chat_id = q.from_user.id
+    today_iso = datetime.now(TZ).date().isoformat()
+    prenotazioni = users.list_prenotazioni_attive(chat_id, today_iso)
+    if not prenotazioni:
+        await q.edit_message_text(
+            "Non hai prenotazioni attive memorizzate dal bot.\n\n"
+            "Nota: vengono mostrate solo le prenotazioni create attraverso questo "
+            "bot. Per cancellare prenotazioni fatte direttamente dal portale, "
+            "vai su 'Gestisci prenotazione' del sito.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Home", callback_data="home")]]),
+        )
+        return
+    rows = []
+    for p in prenotazioni:
+        giorno_d = date.fromisoformat(p.giorno)
+        rows.append([InlineKeyboardButton(
+            f"{label_giorno(giorno_d)} {p.fascia}  {nome_sede(p.area_id)}",
+            callback_data=f"cancel:pick:{p.codice}",
+        )])
+    rows.append([InlineKeyboardButton("⬅️ Home", callback_data="home")])
+    await q.edit_message_text(
+        "Quale prenotazione vuoi annullare?",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def _mostra_cancella_riepilogo(q, context, codice: str):
+    p = users.get_prenotazione(codice)
+    if not p or p.chat_id != q.from_user.id:
+        await q.edit_message_text(
+            "Prenotazione non trovata o non tua.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Home", callback_data="home")]]),
+        )
+        return
+    if p.cancelled_at:
+        await q.edit_message_text(
+            f"Questa prenotazione risulta già cancellata ({p.cancelled_at}).",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Home", callback_data="home")]]),
+        )
+        return
+    giorno_d = date.fromisoformat(p.giorno)
+    testo = (
+        "Stai per *annullare* questa prenotazione:\n\n"
+        f"📍 {nome_sede(p.area_id)}\n"
+        f"📅 {label_giorno(giorno_d)} ({p.giorno})\n"
+        f"🕐 {p.fascia}\n"
+        f"🪑 {p.postazione or '-'}\n"
+        f"🎫 Codice: `{p.codice}`\n\n"
+        "Confermi?"
+    )
+    rows = [[
+        InlineKeyboardButton("✓ Annulla prenotazione", callback_data=f"cancel:confirm:{codice}"),
+        InlineKeyboardButton("✗ No, lascia stare", callback_data="cancel:lista"),
+    ]]
+    await q.edit_message_text(testo, reply_markup=InlineKeyboardMarkup(rows), parse_mode="Markdown")
+
+
+async def _esegui_cancellazione(q, context, codice: str):
+    chat_id = q.from_user.id
+    p = users.get_prenotazione(codice)
+    if not p or p.chat_id != chat_id:
+        await q.edit_message_text("Prenotazione non trovata o non tua.", reply_markup=kb_home())
+        return
+    if p.cancelled_at:
+        await q.edit_message_text("Già cancellata.", reply_markup=kb_home())
+        return
+    payload = users.booking_payload(chat_id)
+    if not payload:
+        await q.edit_message_text(
+            "Il tuo profilo non risulta più approvato.",
+            reply_markup=kb_home(),
+        )
+        return
+    utente, _ = payload
+    cf = utente["codice_fiscale"]
+    await q.edit_message_text("Annullo...")
+    session = context.application.bot_data["session"]
+    res = await asyncio.to_thread(cancella_prenotazione, session, codice, cf)
+    if not res["ok"]:
+        await q.edit_message_text(
+            f"❌ Cancellazione fallita: {res['errore']}",
+            reply_markup=kb_home(),
+        )
+        return
+    users.mark_cancelled(codice)
+    await q.edit_message_text(
+        f"✅ Prenotazione *{codice}* annullata.",
+        reply_markup=kb_home(),
+        parse_mode="Markdown",
+    )
 
 
 # ---------- overview slot ----------
@@ -758,6 +908,7 @@ async def _post_init(app: Application):
     await app.bot.set_my_commands([
         BotCommand("prenota", "Nuova prenotazione (wizard)"),
         BotCommand("domattina", "Prenota domattina al Piano 1"),
+        BotCommand("annulla", "Annulla una prenotazione esistente"),
         BotCommand("slot", "Disponibilità prossimi giorni"),
         BotCommand("profilo", "Vedi il tuo profilo"),
         BotCommand("registra", "Registra il tuo profilo"),
@@ -803,6 +954,7 @@ def main() -> int:
     app.add_handler(CommandHandler("prenota", cmd_prenota))
     app.add_handler(CommandHandler("domattina", cmd_domattina))
     app.add_handler(CommandHandler("slot", cmd_slot))
+    app.add_handler(CommandHandler("annulla", cmd_annulla))
     app.add_handler(CommandHandler("profilo", cmd_profilo))
     app.add_handler(CommandHandler("cancella_profilo", cmd_cancella_profilo))
     app.add_handler(CommandHandler("admin_utenti", cmd_admin_utenti))
