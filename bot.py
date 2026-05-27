@@ -1,18 +1,24 @@
-"""Bot Telegram per AutomaticMozzoLibrary.
+"""Bot Telegram per AutomaticMozzoLibrary — multi-utente.
 
-Comandi:
-    /start      schermata iniziale con scorciatoie
-    /prenota    wizard di prenotazione
-    /domattina  prenota subito mattina al piano 1 di domani
-    /slot       disponibilità prossimi giorni
+Comandi utente:
+    /start              schermata iniziale
+    /registra           registra il proprio profilo (wizard)
+    /profilo            mostra il proprio profilo
+    /cancella_profilo   elimina i propri dati dal bot
+    /prenota            wizard di prenotazione
+    /domattina          shortcut: mattina al Piano 1 di domani
+    /slot               disponibilità prossimi giorni
+
+Comandi admin (solo TELEGRAM_ADMIN_CHAT_IDS):
+    /admin_utenti       lista utenti registrati con stato
 
 Configurazione (.env):
-    TELEGRAM_BOT_TOKEN          token di BotFather
-    TELEGRAM_ALLOWED_CHAT_IDS   chat_id autorizzati, separati da virgola
-    CODICE_FISCALE / EMAIL / TELEFONO / COGNOME_NOME   dati per la prenotazione
-
-Avvio:
-    python bot.py
+    TELEGRAM_BOT_TOKEN
+    TELEGRAM_ADMIN_CHAT_IDS    chat_id admin separati da virgola
+                              (fallback: TELEGRAM_ALLOWED_CHAT_IDS)
+    CODICE_FISCALE / EMAIL / TELEFONO / COGNOME_NOME
+                              dati admin per il bootstrap automatico al
+                              primo avvio (opzionali se l'admin è già in DB)
 """
 from __future__ import annotations
 
@@ -30,14 +36,17 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
 )
 
+import users
 from book import (
     TZ,
     build_session,
     prenota_e_conferma,
     slot_giorno,
-    utente_da_env,
 )
 
 for _stream in (sys.stdout, sys.stderr):
@@ -65,28 +74,48 @@ FASCE = [
 GIORNI_BREVE = ["Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"]
 MAX_GIORNI_AVANTI = 7
 
+# Stati del ConversationHandler /registra
+REG_CF, REG_EMAIL, REG_PHONE, REG_NOME, REG_CONFIRM = range(5)
 
-# ---------- auth ----------
 
-def parse_allowed(raw: str) -> set[int]:
+# ---------- auth helpers ----------
+
+def parse_chat_ids(raw: str) -> set[int]:
     return {int(x.strip()) for x in raw.split(",") if x.strip()}
 
 
-def is_authorized(update: Update, allowed: set[int]) -> bool:
-    chat = update.effective_chat
-    return chat is not None and chat.id in allowed
+def is_admin(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    return chat_id in context.application.bot_data["admins"]
 
 
-async def reject_unauthorized(update: Update, allowed: set[int]) -> bool:
-    if is_authorized(update, allowed):
+def is_authorized(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    return is_admin(chat_id, context) or users.is_approved(chat_id)
+
+
+async def guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """True se NON autorizzato (e ha risposto col messaggio appropriato)."""
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if chat_id is None:
+        return True
+    if is_authorized(chat_id, context):
         return False
-    chat_id = update.effective_chat.id if update.effective_chat else "?"
-    user = update.effective_user.username if update.effective_user else "?"
-    log.warning("Unauthorized chat_id=%s user=%s", chat_id, user)
+    u = users.get_user(chat_id)
+    if u and u.status == users.STATUS_PENDING:
+        msg = (
+            "⏳ La tua registrazione è in attesa di approvazione dall'admin. "
+            "Ti scrivo io quando è approvata."
+        )
+    elif u and u.status == users.STATUS_BANNED:
+        msg = "❌ Il tuo profilo è stato sospeso."
+    else:
+        msg = (
+            "Non sei registrato. Usa /registra per fornire i tuoi dati e "
+            "richiedere l'accesso."
+        )
     if update.message:
-        await update.message.reply_text("Non sei autorizzato a usare questo bot.")
+        await update.message.reply_text(msg)
     elif update.callback_query:
-        await update.callback_query.answer("Non autorizzato.", show_alert=True)
+        await update.callback_query.answer(msg, show_alert=True)
     return True
 
 
@@ -133,7 +162,7 @@ def kb_back(target: str) -> list[InlineKeyboardButton]:
     return [InlineKeyboardButton("⬅️ Indietro", callback_data=target)]
 
 
-# ---------- disponibilità (sync wrappers chiamati da to_thread) ----------
+# ---------- API wrappers (chiamati da to_thread) ----------
 
 def _giorni_con_disponibilita(session, area_id: int) -> list[tuple[date, dict]]:
     today = datetime.now(TZ).date()
@@ -150,44 +179,312 @@ def _fasce_disponibili(session, area_id: int, giorno: date) -> dict[str, dict]:
     return slot_giorno(session, giorno, area_id)
 
 
-# ---------- handlers ----------
+# ---------- comandi base ----------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await reject_unauthorized(update, context.application.bot_data["allowed"]):
+    chat_id = update.effective_chat.id
+    if is_authorized(chat_id, context):
+        await update.message.reply_text("Cosa vuoi fare?", reply_markup=kb_home())
+        return
+    u = users.get_user(chat_id)
+    if u and u.status == users.STATUS_PENDING:
+        await update.message.reply_text(
+            "⏳ Registrazione in attesa di approvazione. Ti scrivo quando approvata."
+        )
         return
     await update.message.reply_text(
-        "Cosa vuoi fare?",
-        reply_markup=kb_home(),
+        "Ciao! Questo bot serve per prenotare un posto studio alla Biblioteca di Mozzo.\n\n"
+        "Per usarlo devi prima registrarti con /registra: ti chiederò i dati che il "
+        "portale richiede al momento della prenotazione (codice fiscale, email, telefono, "
+        "cognome e nome). Quando avrai compilato, l'admin riceverà una notifica per "
+        "approvare il tuo accesso."
     )
 
 
 async def cmd_prenota(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await reject_unauthorized(update, context.application.bot_data["allowed"]):
+    if await guard(update, context):
         return
-    await update.message.reply_text(
-        "Dove vuoi prenotare?",
-        reply_markup=kb_sedi(),
-    )
+    await update.message.reply_text("Dove vuoi prenotare?", reply_markup=kb_sedi())
 
 
 async def cmd_domattina(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await reject_unauthorized(update, context.application.bot_data["allowed"]):
+    if await guard(update, context):
         return
-    await _avvia_quick(update, context, area_id=67, fascia="09:30", giorno=datetime.now(TZ).date() + timedelta(days=1))
+    giorno = datetime.now(TZ).date() + timedelta(days=1)
+    await _avvia_quick(update, context, area_id=67, fascia="09:30", giorno=giorno)
 
 
 async def cmd_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await reject_unauthorized(update, context.application.bot_data["allowed"]):
+    if await guard(update, context):
         return
     await _mostra_slot_overview(update.message, context)
 
 
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await reject_unauthorized(update, context.application.bot_data["allowed"]):
+async def cmd_profilo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    u = users.get_user(chat_id)
+    if not u:
+        await update.message.reply_text(
+            "Non hai un profilo. Usa /registra per crearne uno."
+        )
         return
+    status_label = {
+        users.STATUS_APPROVED: "✅ approvato",
+        users.STATUS_PENDING: "⏳ in attesa",
+        users.STATUS_BANNED: "❌ sospeso",
+    }.get(u.status, u.status)
+    await update.message.reply_text(
+        f"*Il tuo profilo*\n\n"
+        f"👤 {u.cognome_nome}\n"
+        f"🆔 {u.codice_fiscale}\n"
+        f"📧 {u.email}\n"
+        f"📱 {u.telefono}\n"
+        f"Stato: {status_label}\n\n"
+        f"Per modificare i dati: /registra (re-invia il modulo).\n"
+        f"Per cancellare i dati: /cancella_profilo.",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_cancella_profilo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    u = users.get_user(chat_id)
+    if not u:
+        await update.message.reply_text("Non hai un profilo da cancellare.")
+        return
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✓ Sì, cancella", callback_data="profilo:delete_yes"),
+        InlineKeyboardButton("✗ Annulla", callback_data="profilo:delete_no"),
+    ]])
+    await update.message.reply_text(
+        "Sei sicuro di voler cancellare il tuo profilo dal bot?\n"
+        "(Le prenotazioni già confermate sul portale NON vengono toccate: "
+        "se vuoi disdirle, fallo dalla pagina 'Gestisci prenotazione' del portale.)",
+        reply_markup=kb,
+    )
+
+
+# ---------- registrazione (ConversationHandler) ----------
+
+async def reg_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    u = users.get_user(chat_id)
+    if u and u.status == users.STATUS_APPROVED:
+        await update.message.reply_text(
+            "Sei già registrato e approvato. Se vuoi modificare i dati prosegui: "
+            "verrà richiesta di nuovo l'approvazione dell'admin.\n\n"
+            "Per uscire: /annulla"
+        )
+    elif u and u.status == users.STATUS_BANNED:
+        await update.message.reply_text(
+            "Il tuo profilo è sospeso. Contatta l'admin."
+        )
+        return ConversationHandler.END
+    context.user_data["reg"] = {}
+    await update.message.reply_text(
+        "📝 Registrazione (4 passi). In qualsiasi momento /annulla per uscire.\n\n"
+        "1/4 — Mandami il tuo *codice fiscale* (16 caratteri).",
+        parse_mode="Markdown",
+    )
+    return REG_CF
+
+
+async def reg_cf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        cf = users.validate_cf(update.message.text)
+    except ValueError as e:
+        await update.message.reply_text(f"❌ {e}\nRiprova:")
+        return REG_CF
+    context.user_data["reg"]["cf"] = cf
+    await update.message.reply_text("2/4 — Mandami la tua *email*.", parse_mode="Markdown")
+    return REG_EMAIL
+
+
+async def reg_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        email = users.validate_email(update.message.text)
+    except ValueError as e:
+        await update.message.reply_text(f"❌ {e}\nRiprova:")
+        return REG_EMAIL
+    context.user_data["reg"]["email"] = email
+    await update.message.reply_text("3/4 — Mandami il tuo *numero di telefono*.", parse_mode="Markdown")
+    return REG_PHONE
+
+
+async def reg_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        phone = users.validate_phone(update.message.text)
+    except ValueError as e:
+        await update.message.reply_text(f"❌ {e}\nRiprova:")
+        return REG_PHONE
+    context.user_data["reg"]["phone"] = phone
+    await update.message.reply_text(
+        "4/4 — Mandami *cognome e nome* (in quest'ordine, separati da spazio).",
+        parse_mode="Markdown",
+    )
+    return REG_NOME
+
+
+async def reg_nome(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        nome = users.validate_nome(update.message.text)
+    except ValueError as e:
+        await update.message.reply_text(f"❌ {e}\nRiprova:")
+        return REG_NOME
+    context.user_data["reg"]["nome"] = nome
+    d = context.user_data["reg"]
+    testo = (
+        "Controlla i dati:\n\n"
+        f"🆔 {d['cf']}\n"
+        f"📧 {d['email']}\n"
+        f"📱 {d['phone']}\n"
+        f"👤 {d['nome']}\n\n"
+        "Confermi l'invio all'admin per l'approvazione?"
+    )
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✓ Invia", callback_data="reg:submit"),
+        InlineKeyboardButton("✗ Annulla", callback_data="reg:cancel"),
+    ]])
+    await update.message.reply_text(testo, reply_markup=kb)
+    return REG_CONFIRM
+
+
+async def reg_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("reg", None)
+    if update.message:
+        await update.message.reply_text("Registrazione annullata.")
+    return ConversationHandler.END
+
+
+async def reg_submit_from_callback(q, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = q.from_user.id
+    username = q.from_user.username
+    d = context.user_data.get("reg")
+    if not d:
+        await q.edit_message_text("Stato perso. Ricomincia con /registra.")
+        return ConversationHandler.END
+    users.upsert_pending(chat_id, d["cf"], d["email"], d["phone"], d["nome"], username)
+    await q.edit_message_text(
+        "✅ Richiesta inviata. Ti scrivo io quando l'admin approva."
+    )
+    # Notifica admin
+    nome = d["nome"]
+    cf = d["cf"]
+    msg = (
+        f"🆕 Nuova registrazione:\n\n"
+        f"👤 {nome}\n"
+        f"🆔 {cf}\n"
+        f"📧 {d['email']}\n"
+        f"📱 {d['phone']}\n"
+        f"👤 Telegram: @{username or '(nessun username)'}  ({chat_id})\n\n"
+        f"Approva?"
+    )
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✓ Approva", callback_data=f"admin:approve:{chat_id}"),
+        InlineKeyboardButton("✗ Rifiuta", callback_data=f"admin:reject:{chat_id}"),
+    ]])
+    for admin_id in context.application.bot_data["admins"]:
+        try:
+            await context.bot.send_message(admin_id, msg, reply_markup=kb)
+        except Exception as e:
+            log.warning("Impossibile notificare admin %s: %s", admin_id, e)
+    context.user_data.pop("reg", None)
+    return ConversationHandler.END
+
+
+# ---------- admin ----------
+
+async def cmd_admin_utenti(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_chat.id, context):
+        await update.message.reply_text("Solo admin.")
+        return
+    lista = users.list_all()
+    if not lista:
+        await update.message.reply_text("Nessun utente registrato.")
+        return
+    icons = {
+        users.STATUS_APPROVED: "✅",
+        users.STATUS_PENDING: "⏳",
+        users.STATUS_BANNED: "❌",
+    }
+    righe = ["*Utenti registrati:*\n"]
+    for u in lista:
+        uname = f"@{u.telegram_username}" if u.telegram_username else "(no @)"
+        righe.append(
+            f"{icons.get(u.status, '?')} `{u.chat_id}` — {u.cognome_nome} {uname}"
+        )
+    await update.message.reply_text("\n".join(righe), parse_mode="Markdown")
+
+
+# ---------- callback dispatcher ----------
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
     data = q.data or ""
+
+    # --- registrazione (sempre permessa) ---
+    if data == "reg:submit":
+        await q.answer()
+        return await reg_submit_from_callback(q, context)
+    if data == "reg:cancel":
+        await q.answer()
+        context.user_data.pop("reg", None)
+        await q.edit_message_text("Registrazione annullata.")
+        return ConversationHandler.END
+
+    # --- profilo (l'utente cancella se stesso, anche da pending/banned) ---
+    if data == "profilo:delete_yes":
+        await q.answer()
+        users.delete(q.from_user.id)
+        await q.edit_message_text("✅ Profilo cancellato.")
+        return
+    if data == "profilo:delete_no":
+        await q.answer()
+        await q.edit_message_text("Annullato.")
+        return
+
+    # --- admin ---
+    if data.startswith("admin:"):
+        if not is_admin(q.from_user.id, context):
+            await q.answer("Solo admin.", show_alert=True)
+            return
+        _, action, target_s = data.split(":", 2)
+        target_id = int(target_s)
+        target_user = users.get_user(target_id)
+        if not target_user:
+            await q.answer("Utente non più presente.", show_alert=True)
+            await q.edit_message_reply_markup(reply_markup=None)
+            return
+        if action == "approve":
+            users.approve(target_id)
+            await q.edit_message_text(f"✅ Approvato: {target_user.cognome_nome} ({target_id})")
+            try:
+                await context.bot.send_message(
+                    target_id,
+                    "✅ Sei stato approvato! Ora puoi usare /prenota, /domattina, /slot.",
+                    reply_markup=kb_home(),
+                )
+            except Exception as e:
+                log.warning("Notifica approvazione fallita per %s: %s", target_id, e)
+            await q.answer("Approvato.")
+            return
+        if action == "reject":
+            users.delete(target_id)
+            await q.edit_message_text(f"❌ Rifiutato: {target_user.cognome_nome} ({target_id})")
+            try:
+                await context.bot.send_message(
+                    target_id,
+                    "❌ La tua registrazione è stata rifiutata. Contatta l'admin se pensi sia un errore.",
+                )
+            except Exception:
+                pass
+            await q.answer("Rifiutato.")
+            return
+
+    # --- da qui in giù serve essere autorizzati ---
+    if await guard(update, context):
+        return
+    await q.answer()
 
     if data == "home":
         await q.edit_message_text("Cosa vuoi fare?", reply_markup=kb_home())
@@ -242,7 +539,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log.warning("Callback data sconosciuta: %r", data)
 
 
-# ---------- step wizard ----------
+# ---------- step wizard prenotazione ----------
 
 async def _mostra_giorni(q, context, area_id: int):
     await q.edit_message_text(f"Caricamento giorni disponibili per {nome_sede(area_id)}...")
@@ -302,12 +599,10 @@ async def _mostra_riepilogo(q, context, area_id: int, giorno: date, hhmm: str):
         f"🕐 Fascia: {label_fascia(hhmm)}\n\n"
         "Confermi?"
     )
-    rows = [
-        [
-            InlineKeyboardButton("✓ Prenota", callback_data="wiz:confirm"),
-            InlineKeyboardButton("✗ Annulla", callback_data="wiz:annulla"),
-        ],
-    ]
+    rows = [[
+        InlineKeyboardButton("✓ Prenota", callback_data="wiz:confirm"),
+        InlineKeyboardButton("✗ Annulla", callback_data="wiz:annulla"),
+    ]]
     await q.edit_message_text(testo, reply_markup=InlineKeyboardMarkup(rows))
 
 
@@ -319,17 +614,20 @@ async def _esegui_prenotazione(q, context):
         await q.edit_message_text("Stato perso. Ricomincia con /prenota.", reply_markup=kb_home())
         return
     giorno = date.fromisoformat(iso)
+    payload = users.booking_payload(q.from_user.id)
+    if not payload:
+        await q.edit_message_text(
+            "Il tuo profilo non risulta più approvato. Verifica con /profilo.",
+        )
+        return
+    utente, cognome_nome = payload
     await q.edit_message_text("Prenoto...")
     session = context.application.bot_data["session"]
-    utente, cognome_nome = context.application.bot_data["utente"]
     res = await asyncio.to_thread(
         prenota_e_conferma, session, giorno, hhmm, area_id, utente, cognome_nome, False
     )
     if not res["ok"]:
-        await q.edit_message_text(
-            f"❌ Errore: {res['errore']}",
-            reply_markup=kb_home(),
-        )
+        await q.edit_message_text(f"❌ Errore: {res['errore']}", reply_markup=kb_home())
         return
     testo = (
         "✅ Prenotazione confermata.\n\n"
@@ -340,13 +638,13 @@ async def _esegui_prenotazione(q, context):
         f"🎫 Codice: {res['codice']}"
     )
     await q.edit_message_text(testo, reply_markup=kb_home())
-    context.user_data.clear()
+    for k in ("area_id", "giorno", "fascia"):
+        context.user_data.pop(k, None)
 
 
-# ---------- shortcut "domattina" ----------
+# ---------- shortcut domattina ----------
 
 async def _avvia_quick(update: Update, context: ContextTypes.DEFAULT_TYPE, area_id: int, fascia: str, giorno: date):
-    """Riepilogo immediato per scorciatoia: salta sede/giorno/fascia."""
     context.user_data["area_id"] = area_id
     context.user_data["giorno"] = giorno.isoformat()
     context.user_data["fascia"] = fascia
@@ -357,9 +655,7 @@ async def _avvia_quick(update: Update, context: ContextTypes.DEFAULT_TYPE, area_
     slots = await asyncio.to_thread(slot_giorno, session, giorno, area_id)
     info = slots.get(slot_key)
     if not info or info["disponibili"] == 0:
-        msg = (
-            f"❌ Slot {slot_key} non disponibile per {label_giorno(giorno)} a {nome_sede(area_id)}."
-        )
+        msg = f"❌ Slot {slot_key} non disponibile per {label_giorno(giorno)} a {nome_sede(area_id)}."
         if update.callback_query:
             await update.callback_query.edit_message_text(msg, reply_markup=kb_home())
         else:
@@ -373,11 +669,10 @@ async def _avvia_quick(update: Update, context: ContextTypes.DEFAULT_TYPE, area_
         f"🕐 {label_fascia(fascia)} — {info['disponibili']}/{info['su']} liberi\n\n"
         "Confermi?"
     )
-    rows = [[
+    markup = InlineKeyboardMarkup([[
         InlineKeyboardButton("✓ Prenota", callback_data="wiz:confirm"),
         InlineKeyboardButton("✗ Annulla", callback_data="wiz:annulla"),
-    ]]
-    markup = InlineKeyboardMarkup(rows)
+    ]])
     if update.callback_query:
         await update.callback_query.edit_message_text(testo, reply_markup=markup)
     else:
@@ -411,11 +706,36 @@ async def _mostra_slot_overview(target, context, edit: bool = False):
 
 # ---------- bootstrap ----------
 
+def bootstrap_admin_from_env(admins: set[int]) -> None:
+    """Se l'admin non è ancora nel DB e ci sono i 4 campi nel .env, lo crea approved."""
+    cf = os.environ.get("CODICE_FISCALE")
+    email = os.environ.get("EMAIL")
+    phone = os.environ.get("TELEFONO")
+    nome = os.environ.get("COGNOME_NOME")
+    if not (cf and email and phone and nome):
+        return
+    try:
+        cf_n = users.validate_cf(cf)
+        email_n = users.validate_email(email)
+        phone_n = users.validate_phone(phone)
+        nome_n = users.validate_nome(nome)
+    except ValueError as e:
+        log.warning("Bootstrap admin: dati .env non validi: %s", e)
+        return
+    for admin_id in admins:
+        if not users.get_user(admin_id):
+            users.upsert_approved(admin_id, cf_n, email_n, phone_n, nome_n, None)
+            log.info("Admin %s bootstrappato nel DB da .env", admin_id)
+
+
 async def _post_init(app: Application):
     await app.bot.set_my_commands([
         BotCommand("prenota", "Nuova prenotazione (wizard)"),
         BotCommand("domattina", "Prenota domattina al Piano 1"),
         BotCommand("slot", "Disponibilità prossimi giorni"),
+        BotCommand("profilo", "Vedi il tuo profilo"),
+        BotCommand("registra", "Registra il tuo profilo"),
+        BotCommand("cancella_profilo", "Elimina i tuoi dati dal bot"),
         BotCommand("start", "Schermata iniziale"),
     ])
     log.info("Comandi bot registrati. Bot avviato.")
@@ -428,13 +748,19 @@ def main() -> int:
     if not token:
         log.error("TELEGRAM_BOT_TOKEN non impostato nel .env")
         return 1
-    allowed_raw = os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", "")
-    allowed = parse_allowed(allowed_raw)
-    if not allowed:
-        log.error("TELEGRAM_ALLOWED_CHAT_IDS vuoto o non valido")
+
+    admins_raw = (
+        os.environ.get("TELEGRAM_ADMIN_CHAT_IDS")
+        or os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", "")
+    )
+    admins = parse_chat_ids(admins_raw)
+    if not admins:
+        log.error("TELEGRAM_ADMIN_CHAT_IDS vuoto o non valido")
         return 1
 
-    utente, cognome_nome = utente_da_env()
+    users.init_db()
+    bootstrap_admin_from_env(admins)
+
     session = build_session()
 
     app = (
@@ -443,17 +769,38 @@ def main() -> int:
         .post_init(_post_init)
         .build()
     )
-    app.bot_data["allowed"] = allowed
+    app.bot_data["admins"] = admins
     app.bot_data["session"] = session
-    app.bot_data["utente"] = (utente, cognome_nome)
 
+    # Comandi base
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("prenota", cmd_prenota))
     app.add_handler(CommandHandler("domattina", cmd_domattina))
     app.add_handler(CommandHandler("slot", cmd_slot))
+    app.add_handler(CommandHandler("profilo", cmd_profilo))
+    app.add_handler(CommandHandler("cancella_profilo", cmd_cancella_profilo))
+    app.add_handler(CommandHandler("admin_utenti", cmd_admin_utenti))
+
+    # ConversationHandler /registra
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("registra", reg_start)],
+        states={
+            REG_CF: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_cf)],
+            REG_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_email)],
+            REG_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_phone)],
+            REG_NOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_nome)],
+            REG_CONFIRM: [CallbackQueryHandler(on_callback, pattern=r"^reg:")],
+        },
+        fallbacks=[CommandHandler("annulla", reg_cancel)],
+        name="registra",
+        persistent=False,
+    )
+    app.add_handler(conv)
+
+    # Tutti gli altri callback (wizard, admin, profilo, home)
     app.add_handler(CallbackQueryHandler(on_callback))
 
-    log.info("Whitelist chat_ids: %s", allowed)
+    log.info("Admin chat_ids: %s", admins)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
     return 0
 

@@ -79,59 +79,96 @@ Imposti dal portale, replicati dallo script solo via messaggio d'errore:
   giorni. Cancella la prenotazione se non puoi andare:
   [Gestisci prenotazione](https://easyplanning.easystaff.it/portale/mozzo-biblio/index.php?include=manage).
 
-## Bot Telegram
+## Bot Telegram (multi-utente)
 
-`bot.py` espone le stesse funzioni della CLI via bot Telegram con interfaccia
-a bottoni inline (nessun comando da digitare a mano oltre a `/start`).
+`bot.py` espone le funzioni della CLI come bot Telegram con interfaccia a
+bottoni inline. Supporta più utenti: ognuno fornisce i propri dati al primo
+accesso e — dopo l'approvazione dell'admin — può prenotare a proprio nome.
+I limiti del portale (14 prenotazioni/7gg) sono per codice fiscale, quindi ogni
+utente ha il suo budget indipendente.
 
 ### Setup bot
 
 1. Su Telegram cerca `@BotFather`, manda `/newbot`, scegli nome+username, salva
    il token.
-2. Cerca `@userinfobot` e annota il tuo `Id` numerico.
-3. Aggiungi al tuo `.env`:
+2. Per l'admin: cerca `@userinfobot` e annota il tuo `Id` numerico.
+3. Aggiungi al `.env`:
    ```env
    TELEGRAM_BOT_TOKEN=1234567890:AA...
-   TELEGRAM_ALLOWED_CHAT_IDS=123456789
+   TELEGRAM_ADMIN_CHAT_IDS=123456789
+   # Dati admin (opzionali ma consigliati): vengono usati al primo avvio per
+   # creare il tuo profilo già approvato nel DB.
+   CODICE_FISCALE=RSSMRA80A01H501U
+   EMAIL=mario.rossi@example.com
+   TELEFONO=333 1234567
+   COGNOME_NOME=Rossi Mario
    ```
-   `TELEGRAM_ALLOWED_CHAT_IDS` accetta più id separati da virgola; tutti gli
-   altri chat_id vengono rifiutati.
-4. Installa la dipendenza extra:
+4. Installa le dipendenze e avvia:
    ```bash
    pip install -r requirements.txt
-   ```
-5. Avvia il bot:
-   ```bash
    python bot.py
    ```
 
-### Comandi
+I profili degli utenti vengono salvati in `data/users.db` (SQLite). Il file
+viene creato automaticamente al primo avvio.
+
+### Comandi utente
 
 | Comando | Cosa fa |
 |---|---|
-| `/start` | Schermata iniziale con scorciatoie |
-| `/prenota` | Wizard a bottoni: sede → giorno → fascia → conferma |
-| `/domattina` | Prenota subito mattina al Piano 1 di domani (un tap) |
-| `/slot` | Mostra disponibilità prossimi 7 giorni su entrambe le sedi |
+| `/start` | Schermata iniziale |
+| `/registra` | Wizard per fornire i propri dati (CF, email, telefono, nome) |
+| `/profilo` | Mostra il proprio profilo e lo stato (in attesa / approvato) |
+| `/cancella_profilo` | Elimina i propri dati dal bot |
+| `/prenota` | Wizard prenotazione: sede → giorno → fascia → conferma |
+| `/domattina` | Scorciatoia: mattina al Piano 1 di domani |
+| `/slot` | Disponibilità prossimi 7 giorni su entrambe le sedi |
 
-I bottoni del wizard mostrano solo i giorni e le fasce con posti effettivamente
-liberi. Lo stato del wizard sta in memoria del processo: se il bot riparte,
-basta digitare `/prenota` per ricominciare.
+### Comandi admin
+
+| Comando | Cosa fa |
+|---|---|
+| `/admin_utenti` | Lista degli utenti registrati con stato e chat_id |
+
+L'admin riceve **una notifica Telegram con bottoni `[Approva][Rifiuta]`** ogni
+volta che un nuovo utente completa la registrazione.
+
+### Flusso onboarding
+
+1. Un nuovo utente apre la chat col bot e fa `/start`.
+2. Bot lo invita a fare `/registra`.
+3. Bot chiede in sequenza: codice fiscale → email → telefono → cognome e nome.
+4. Riepilogo e conferma. La registrazione passa in stato `pending`.
+5. L'admin riceve la notifica con i dati e i bottoni `[Approva][Rifiuta]`.
+6. Approvazione → l'utente riceve un messaggio di conferma e può prenotare.
+
+### Privacy
+
+Il file `data/users.db` contiene dati personali (codici fiscali) in chiaro.
+È nel `.gitignore` e nel `.dockerignore`, quindi non finisce nei push. Per il
+deploy server: assicurati che la cartella `data/` sia protetta nei permessi
+filesystem e backuppata in modo sicuro se contiene dati di terzi.
 
 ### Deploy su server con Docker (consigliato)
 
-Il repo include `Dockerfile` e `docker-compose.yml`. Il container è
-stateless (lo stato del wizard sta in memoria del processo: se il container
-riparte, basta rifare `/prenota` su Telegram).
+Il repo include `Dockerfile` e `docker-compose.yml`. Il `docker-compose.yml`
+mappa la cartella `./data` come volume bind: lì vive `users.db` con i
+profili degli utenti registrati. Lo stato volatile del wizard di
+prenotazione resta in memoria del processo: se il container riparte basta
+rifare `/prenota`, i profili e le approvazioni invece sopravvivono.
 
 ```bash
 git clone https://github.com/MCGabbo/AutomaticMozzoLibrary.git
 cd AutomaticMozzoLibrary
 cp .env.example .env
-nano .env                   # compila CF, email, telefono, nome, token, chat_id
+nano .env                   # compila CF, email, telefono, nome, token, admin chat_id
+mkdir -p data               # cartella per users.db (l'host la crea col tuo user)
 docker compose up -d --build
 docker compose logs -f
 ```
+
+> Se vedi errori di permessi su `data/users.db`, allinea il proprietario al
+> non-root user del container: `sudo chown -R 1000:1000 data`.
 
 Aggiornamento:
 ```bash

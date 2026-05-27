@@ -15,3 +15,5 @@ LICENSE
 Dockerfile
 docker-compose.yml
 .dockerignore
+HANDOFF.md
+data/
