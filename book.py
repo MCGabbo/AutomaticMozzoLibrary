@@ -1,10 +1,13 @@
-"""CLI per prenotare un posto studio sul portale easystaff (biblioteca di Mozzo).
+"""CLI e funzioni core per prenotare un posto studio sul portale easystaff (biblioteca di Mozzo).
 
-Esempi:
+Esempi CLI:
     python book.py aree
     python book.py slot --giorno domani --sede piano1
     python book.py prenota --giorno domani --fascia mattina --sede piano1
     python book.py prenota --giorno 2026-05-29 --fascia 14:30 --sede narrativa --dry-run
+
+Le funzioni `lista_aree`, `slot_giorno`, `prenota_e_conferma` e `build_session`
+sono importabili da altri moduli (es. bot.py).
 """
 from __future__ import annotations
 
@@ -34,7 +37,6 @@ DURATA_SECONDI = 10800      # 3h
 FORM_KEY_COGNOME_NOME = "1611226175"
 TZ = ZoneInfo("Europe/Rome")
 
-# Alias sede → area_id (dalla risposta /api/aree/9). Estendibili con `book.py aree`.
 SEDE_ALIAS = {
     "piano1": 67,
     "primopiano": 67,
@@ -56,6 +58,10 @@ GIORNI_SETTIMANA = {
 }
 
 
+class PrenotazioneError(Exception):
+    """Errore atteso durante una prenotazione (slot esaurito, server in errore, ecc)."""
+
+
 def build_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({
@@ -70,6 +76,121 @@ def build_session() -> requests.Session:
     })
     return s
 
+
+# ---------- core API ----------
+
+def lista_aree(session: requests.Session) -> list[dict]:
+    r = session.get(f"{BASE}/api/aree/{CLIENTE_ID}")
+    r.raise_for_status()
+    return r.json()["aree"]
+
+
+def slot_giorno(session: requests.Session, giorno: date, area_id: int) -> dict[str, dict]:
+    """Mappa 'HH:MM-HH:MM' -> {'disponibili': n, 'su': n, 'reserved': bool}.
+
+    Ritorna dict vuoto se il giorno è chiuso o non disponibile.
+    """
+    url = f"{BASE}/api/entry/{ENTRY_TYPE}/schedule/{giorno.isoformat()}/{area_id}/{DURATA_SECONDI}"
+    r = session.get(url)
+    r.raise_for_status()
+    sched = r.json().get("schedule", {})
+    if not isinstance(sched, dict):
+        return {}
+    day = sched.get(giorno.isoformat())
+    return day if isinstance(day, dict) else {}
+
+
+def prenota_e_conferma(
+    session: requests.Session,
+    giorno: date,
+    inizio_hhmm: str,
+    area_id: int,
+    utente: dict,
+    cognome_nome: str,
+    dry_run: bool = False,
+) -> dict:
+    """Esegue store + confirm. Ritorna dict con esito.
+
+    utente = {'codice_fiscale': ..., 'email': ..., 'phone': ...}
+
+    Ritorna:
+        {'ok': True, 'codice': str, 'entry': int, 'postazione': str, 'slot': str}
+        oppure
+        {'ok': False, 'errore': str, 'slot': str}
+    """
+    start_dt = datetime.combine(
+        giorno, datetime.strptime(inizio_hhmm, "%H:%M").time(), tzinfo=TZ
+    )
+    end_dt = start_dt + timedelta(seconds=DURATA_SECONDI)
+    slot_key = f"{inizio_hhmm}-{end_dt.strftime('%H:%M')}"
+
+    slots = slot_giorno(session, giorno, area_id)
+    info = slots.get(slot_key)
+    if not info:
+        return {"ok": False, "slot": slot_key, "errore": f"Slot {slot_key} inesistente"}
+    if info["disponibili"] == 0:
+        return {"ok": False, "slot": slot_key, "errore": f"Slot {slot_key} esaurito (0/{info['su']})"}
+
+    body = {
+        "reservation_number": 0,
+        "cliente": CLIENTE_SLUG,
+        "start_time": int(start_dt.timestamp()),
+        "end_time": int(end_dt.timestamp()),
+        "durata": str(DURATA_SECONDI),
+        "entry_type": ENTRY_TYPE,
+        "area": area_id,
+        "public_primary": utente["codice_fiscale"],
+        "utente": utente,
+        "servizio": {FORM_KEY_COGNOME_NOME: cognome_nome},
+        "backoffice": {},
+        "risorsa": None,
+        "recaptchaToken": None,
+        "timezone": "Europe/Rome",
+    }
+
+    if dry_run:
+        return {
+            "ok": True,
+            "dry_run": True,
+            "slot": slot_key,
+            "codice": "(dry-run)",
+            "entry": 0,
+            "postazione": "(dry-run)",
+        }
+
+    rs = session.post(f"{BASE}/api/entry/store", json=body)
+    if not rs.ok:
+        return {"ok": False, "slot": slot_key, "errore": f"store HTTP {rs.status_code}: {rs.text[:200]}"}
+    store_resp = rs.json()
+    entry_id = store_resp["entry"]
+    risorsa = (store_resp.get("risorsa") or {}).get("resource_name", "?")
+    codice = store_resp.get("codice_prenotazione", "?")
+
+    rc = session.post(f"{BASE}/api/entry/confirm/{entry_id}")
+    if not rc.ok:
+        return {"ok": False, "slot": slot_key, "errore": f"confirm HTTP {rc.status_code}: {rc.text[:200]}"}
+
+    return {
+        "ok": True,
+        "slot": slot_key,
+        "codice": codice,
+        "entry": entry_id,
+        "postazione": risorsa,
+    }
+
+
+def utente_da_env() -> tuple[dict, str]:
+    """Estrae utente e cognome_nome dalle variabili d'ambiente (.env già caricato)."""
+    utente = {
+        "codice_fiscale": os.environ["CODICE_FISCALE"],
+        "email": os.environ["EMAIL"],
+        "phone": os.environ["TELEFONO"],
+    }
+    cognome_nome = os.environ["COGNOME_NOME"]
+    return utente, cognome_nome
+
+
+# ---------- parsing CLI ----------
 
 def parse_giorno(s: str) -> date:
     s = s.strip().lower()
@@ -116,10 +237,10 @@ def resolve_sede(s: str) -> int:
     )
 
 
+# ---------- CLI commands ----------
+
 def cmd_aree(session: requests.Session, _args) -> int:
-    r = session.get(f"{BASE}/api/aree/{CLIENTE_ID}")
-    r.raise_for_status()
-    aree = r.json()["aree"]
+    aree = lista_aree(session)
     print(f"{'ID':>4}  {'NOME':40s}  CODE")
     print("-" * 80)
     for a in aree:
@@ -130,15 +251,12 @@ def cmd_aree(session: requests.Session, _args) -> int:
 def cmd_slot(session: requests.Session, args) -> int:
     giorno = parse_giorno(args.giorno)
     area = resolve_sede(args.sede)
-    url = f"{BASE}/api/entry/{ENTRY_TYPE}/schedule/{giorno.isoformat()}/{area}/{DURATA_SECONDI}"
-    r = session.get(url)
-    r.raise_for_status()
-    payload = r.json().get("schedule", {}).get(giorno.isoformat(), {})
-    if not payload:
+    slots = slot_giorno(session, giorno, area)
+    if not slots:
         print(f"Nessuno slot per {giorno} sede {area}.")
         return 1
     print(f"Slot disponibili — {giorno} sede {area}:")
-    for orario, info in payload.items():
+    for orario, info in slots.items():
         flag = "[OK]" if info["disponibili"] > 0 else "[--]"
         print(f"  {flag} {orario}  ({info['disponibili']}/{info['su']} liberi)")
     return 0
@@ -148,74 +266,20 @@ def cmd_prenota(session: requests.Session, args) -> int:
     giorno = parse_giorno(args.giorno)
     inizio_hhmm = parse_fascia(args.fascia)
     area = resolve_sede(args.sede)
+    utente, cognome_nome = utente_da_env()
 
-    start_dt = datetime.combine(
-        giorno, datetime.strptime(inizio_hhmm, "%H:%M").time(), tzinfo=TZ
-    )
-    end_dt = start_dt + timedelta(seconds=DURATA_SECONDI)
-
-    # Verifica che lo slot esista davvero
-    url_schedule = f"{BASE}/api/entry/{ENTRY_TYPE}/schedule/{giorno.isoformat()}/{area}/{DURATA_SECONDI}"
-    r = session.get(url_schedule)
-    r.raise_for_status()
-    slots = r.json().get("schedule", {}).get(giorno.isoformat(), {})
-    fine_hhmm = (start_dt + timedelta(seconds=DURATA_SECONDI)).strftime("%H:%M")
-    slot_key = f"{inizio_hhmm}-{fine_hhmm}"
-    if slot_key not in slots:
-        print(f"Slot {slot_key} non trovato per {giorno} sede {area}.")
-        print(f"Disponibili: {', '.join(slots.keys()) or '(nessuno)'}")
-        return 1
-    info = slots[slot_key]
-    if info["disponibili"] == 0:
-        print(f"Slot {slot_key} esaurito ({info['su']}/{info['su']} occupati).")
-        return 1
-
-    utente = {
-        "codice_fiscale": os.environ["CODICE_FISCALE"],
-        "email": os.environ["EMAIL"],
-        "phone": os.environ["TELEFONO"],
-    }
-    cognome_nome = os.environ["COGNOME_NOME"]
-
-    body = {
-        "reservation_number": 0,
-        "cliente": CLIENTE_SLUG,
-        "start_time": int(start_dt.timestamp()),
-        "end_time": int(end_dt.timestamp()),
-        "durata": str(DURATA_SECONDI),
-        "entry_type": ENTRY_TYPE,
-        "area": area,
-        "public_primary": utente["codice_fiscale"],
-        "utente": utente,
-        "servizio": {FORM_KEY_COGNOME_NOME: cognome_nome},
-        "backoffice": {},
-        "risorsa": None,
-        "recaptchaToken": None,
-        "timezone": "Europe/Rome",
-    }
-
-    print(f"-> {giorno} {slot_key}  sede {area}  ({info['disponibili']}/{info['su']} liberi)")
-    print(f"  utente: {cognome_nome}  ({utente['codice_fiscale']})")
-
+    print(f"-> {giorno} {inizio_hhmm}+3h  sede {area}  utente: {cognome_nome} ({utente['codice_fiscale']})")
     if args.dry_run:
         print("DRY-RUN: nessuna chiamata di prenotazione effettuata.")
-        return 0
 
-    rs = session.post(f"{BASE}/api/entry/store", json=body)
-    if not rs.ok:
-        print(f"Errore store: HTTP {rs.status_code} — {rs.text[:300]}")
+    res = prenota_e_conferma(session, giorno, inizio_hhmm, area, utente, cognome_nome, dry_run=args.dry_run)
+    if not res["ok"]:
+        print(f"Errore: {res['errore']}")
         return 2
-    store_resp = rs.json()
-    entry_id = store_resp["entry"]
-    risorsa = store_resp.get("risorsa", {})
-    codice = store_resp.get("codice_prenotazione", "?")
-    print(f"  store ok → entry {entry_id}, codice {codice}, posto: {risorsa.get('resource_name')}")
-
-    rc = session.post(f"{BASE}/api/entry/confirm/{entry_id}")
-    if not rc.ok:
-        print(f"Errore confirm: HTTP {rc.status_code} — {rc.text[:300]}")
-        return 3
-    print(f"[OK] Prenotazione confermata. Codice: {codice}")
+    if res.get("dry_run"):
+        return 0
+    print(f"  store ok -> entry {res['entry']}, posto: {res['postazione']}")
+    print(f"[OK] Prenotazione confermata. Codice: {res['codice']}")
     return 0
 
 

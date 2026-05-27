@@ -79,6 +79,73 @@ Imposti dal portale, replicati dallo script solo via messaggio d'errore:
   giorni. Cancella la prenotazione se non puoi andare:
   [Gestisci prenotazione](https://easyplanning.easystaff.it/portale/mozzo-biblio/index.php?include=manage).
 
+## Bot Telegram
+
+`bot.py` espone le stesse funzioni della CLI via bot Telegram con interfaccia
+a bottoni inline (nessun comando da digitare a mano oltre a `/start`).
+
+### Setup bot
+
+1. Su Telegram cerca `@BotFather`, manda `/newbot`, scegli nome+username, salva
+   il token.
+2. Cerca `@userinfobot` e annota il tuo `Id` numerico.
+3. Aggiungi al tuo `.env`:
+   ```env
+   TELEGRAM_BOT_TOKEN=1234567890:AA...
+   TELEGRAM_ALLOWED_CHAT_IDS=123456789
+   ```
+   `TELEGRAM_ALLOWED_CHAT_IDS` accetta più id separati da virgola; tutti gli
+   altri chat_id vengono rifiutati.
+4. Installa la dipendenza extra:
+   ```bash
+   pip install -r requirements.txt
+   ```
+5. Avvia il bot:
+   ```bash
+   python bot.py
+   ```
+
+### Comandi
+
+| Comando | Cosa fa |
+|---|---|
+| `/start` | Schermata iniziale con scorciatoie |
+| `/prenota` | Wizard a bottoni: sede → giorno → fascia → conferma |
+| `/domattina` | Prenota subito mattina al Piano 1 di domani (un tap) |
+| `/slot` | Mostra disponibilità prossimi 7 giorni su entrambe le sedi |
+
+I bottoni del wizard mostrano solo i giorni e le fasce con posti effettivamente
+liberi. Lo stato del wizard sta in memoria del processo: se il bot riparte,
+basta digitare `/prenota` per ricominciare.
+
+### Deploy su server (systemd)
+
+Esempio di unit `/etc/systemd/system/autobiblio-bot.service`:
+
+```ini
+[Unit]
+Description=AutomaticMozzoLibrary Telegram bot
+After=network-online.target
+
+[Service]
+Type=simple
+User=gabri
+WorkingDirectory=/home/gabri/AutomaticMozzoLibrary
+ExecStart=/home/gabri/AutomaticMozzoLibrary/.venv/bin/python bot.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Poi:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now autobiblio-bot
+journalctl -u autobiblio-bot -f
+```
+
 ## Reverse engineering
 
 Le API usate sono state estratte ispezionando il traffico di rete del portale
