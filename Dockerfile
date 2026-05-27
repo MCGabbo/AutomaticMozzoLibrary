@@ -10,7 +10,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-COPY book.py bot.py ./
+COPY book.py bot.py users.py ./
 
 RUN useradd -r -u 1000 -m -d /home/app app && chown -R app:app /app
 USER app
