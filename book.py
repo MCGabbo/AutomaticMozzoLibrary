@@ -21,6 +21,8 @@ from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
@@ -64,6 +66,22 @@ class PrenotazioneError(Exception):
 
 def build_session() -> requests.Session:
     s = requests.Session()
+    # Retry trasparenti SOLO su GET/HEAD: il portale a volte chiude le
+    # connessioni idle (RemoteDisconnected). I POST (store/confirm) NON
+    # vengono ritentati per evitare prenotazioni duplicate.
+    retries = Retry(
+        total=5,
+        connect=3,
+        read=3,
+        status=2,
+        backoff_factor=0.5,
+        status_forcelist=(500, 502, 503, 504),
+        allowed_methods=("HEAD", "GET"),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
     s.headers.update({
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json;charset=utf-8",

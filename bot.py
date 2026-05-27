@@ -728,6 +728,22 @@ def bootstrap_admin_from_env(admins: set[int]) -> None:
             log.info("Admin %s bootstrappato nel DB da .env", admin_id)
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Logga in modo conciso e prova a dare feedback all'utente."""
+    err = context.error
+    log.error("Update error: %s: %s", type(err).__name__, err)
+    if not isinstance(update, Update):
+        return
+    msg = "⚠️ Errore temporaneo (connessione al portale). Riprova tra qualche secondo."
+    try:
+        if update.callback_query:
+            await update.callback_query.answer(msg, show_alert=True)
+        elif update.message:
+            await update.message.reply_text(msg)
+    except Exception as e:
+        log.warning("Impossibile notificare l'utente dell'errore: %s", e)
+
+
 async def _post_init(app: Application):
     await app.bot.set_my_commands([
         BotCommand("prenota", "Nuova prenotazione (wizard)"),
@@ -799,6 +815,9 @@ def main() -> int:
 
     # Tutti gli altri callback (wizard, admin, profilo, home)
     app.add_handler(CallbackQueryHandler(on_callback))
+
+    # Error handler globale
+    app.add_error_handler(on_error)
 
     log.info("Admin chat_ids: %s", admins)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
