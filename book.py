@@ -15,6 +15,8 @@ import argparse
 import os
 import re
 import sys
+import threading
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -38,6 +40,14 @@ ENTRY_TYPE = 130            # "Prenotazione Posto studio"
 DURATA_SECONDI = 10800      # 3h
 FORM_KEY_COGNOME_NOME = "1611226175"
 TZ = ZoneInfo("Europe/Rome")
+
+# Dal 2026-06-08 il portale protegge schedule/store/confirm con un cookie JWT
+# "guest" (jwt_public) a vita breve, emesso da GET /api/aree/{cliente}. Dura
+# 120s: lo rinfreschiamo proattivamente con un margine di sicurezza. La sessione
+# è condivisa fra thread paralleli (bot.py), quindi serializziamo il refresh.
+_GUEST_TOKEN_TTL = 120          # secondi (Max-Age del cookie jwt_public)
+_GUEST_TOKEN_MARGIN = 25        # rinfresca se manca meno di questo alla scadenza
+_token_lock = threading.Lock()
 
 SEDE_ALIAS = {
     "piano1": 67,
@@ -95,11 +105,59 @@ def build_session() -> requests.Session:
     return s
 
 
+# ---------- autenticazione (cookie guest jwt_public) ----------
+
+def _mark_token_fresh(session: requests.Session) -> None:
+    """Registra che la sessione ha appena ricevuto un cookie guest fresco."""
+    session._guest_token_at = time.monotonic()  # type: ignore[attr-defined]
+
+
+def _ensure_guest_token(session: requests.Session, force: bool = False) -> None:
+    """Garantisce un cookie guest `jwt_public` valido sulla sessione.
+
+    easystaff lo emette su GET /api/aree/{cliente}; requests.Session lo salva
+    e lo riallega da solo alle richieste successive. Vale 120s, quindi lo
+    rinfreschiamo prima della scadenza. Il lock evita che i thread paralleli
+    di bot.py lo rigenerino tutti insieme.
+    """
+    with _token_lock:
+        issued = getattr(session, "_guest_token_at", 0.0)
+        if not force and time.monotonic() - issued < _GUEST_TOKEN_TTL - _GUEST_TOKEN_MARGIN:
+            return
+        r = session.get(f"{BASE}/api/aree/{CLIENTE_ID}")
+        r.raise_for_status()
+        _mark_token_fresh(session)
+
+
+def _authed_get(session: requests.Session, url: str, **kwargs) -> requests.Response:
+    """GET su endpoint protetto: assicura il token e, se scade a metà ciclo
+    (401), lo rinfresca forzato e riprova una sola volta."""
+    _ensure_guest_token(session)
+    r = session.get(url, **kwargs)
+    if r.status_code == 401:
+        _ensure_guest_token(session, force=True)
+        r = session.get(url, **kwargs)
+    return r
+
+
+def _authed_post(session: requests.Session, url: str, **kwargs) -> requests.Response:
+    """POST su endpoint protetto. Un 401 viene rifiutato dall'auth PRIMA che il
+    server crei alcunché, quindi rinfrescare e riprovare una volta è sicuro e
+    non genera prenotazioni duplicate."""
+    _ensure_guest_token(session)
+    r = session.post(url, **kwargs)
+    if r.status_code == 401:
+        _ensure_guest_token(session, force=True)
+        r = session.post(url, **kwargs)
+    return r
+
+
 # ---------- core API ----------
 
 def lista_aree(session: requests.Session) -> list[dict]:
     r = session.get(f"{BASE}/api/aree/{CLIENTE_ID}")
     r.raise_for_status()
+    _mark_token_fresh(session)  # questa GET emette anche il cookie guest
     return r.json()["aree"]
 
 
@@ -109,7 +167,7 @@ def slot_giorno(session: requests.Session, giorno: date, area_id: int) -> dict[s
     Ritorna dict vuoto se il giorno è chiuso o non disponibile.
     """
     url = f"{BASE}/api/entry/{ENTRY_TYPE}/schedule/{giorno.isoformat()}/{area_id}/{DURATA_SECONDI}"
-    r = session.get(url)
+    r = _authed_get(session, url)
     r.raise_for_status()
     sched = r.json().get("schedule", {})
     if not isinstance(sched, dict):
@@ -176,7 +234,7 @@ def prenota_e_conferma(
             "postazione": "(dry-run)",
         }
 
-    rs = session.post(f"{BASE}/api/entry/store", json=body)
+    rs = _authed_post(session, f"{BASE}/api/entry/store", json=body)
     if not rs.ok:
         return {"ok": False, "slot": slot_key, "errore": f"store HTTP {rs.status_code}: {rs.text[:200]}"}
     store_resp = rs.json()
@@ -184,7 +242,7 @@ def prenota_e_conferma(
     risorsa = (store_resp.get("risorsa") or {}).get("resource_name", "?")
     codice = store_resp.get("codice_prenotazione", "?")
 
-    rc = session.post(f"{BASE}/api/entry/confirm/{entry_id}")
+    rc = _authed_post(session, f"{BASE}/api/entry/confirm/{entry_id}")
     if not rc.ok:
         return {"ok": False, "slot": slot_key, "errore": f"confirm HTTP {rc.status_code}: {rc.text[:200]}"}
 
@@ -203,7 +261,7 @@ def cancella_prenotazione(session: requests.Session, codice: str, cf: str) -> di
     Ritorna {'ok': True} oppure {'ok': False, 'errore': str}.
     """
     url = f"{BASE}/api/entry/delete/{codice}"
-    r = session.post(url, params={"chiave": cf})
+    r = _authed_post(session, url, params={"chiave": cf})
     if not r.ok:
         return {"ok": False, "errore": f"delete HTTP {r.status_code}: {r.text[:200]}"}
     try:
