@@ -47,6 +47,9 @@ TZ = ZoneInfo("Europe/Rome")
 # è condivisa fra thread paralleli (bot.py), quindi serializziamo il refresh.
 _GUEST_TOKEN_TTL = 120          # secondi (Max-Age del cookie jwt_public)
 _GUEST_TOKEN_MARGIN = 25        # rinfresca se manca meno di questo alla scadenza
+# Backoff (s) per il 401 "unauthorized.too_fast": lascia invecchiare il token
+# guest e riprova lo stesso POST senza rigenerarlo.
+_STORE_RETRY_DELAYS = (3.0, 5.0, 8.0)
 _token_lock = threading.Lock()
 
 SEDE_ALIAS = {
@@ -142,14 +145,29 @@ def _authed_get(session: requests.Session, url: str, **kwargs) -> requests.Respo
 
 def _authed_post(session: requests.Session, url: str, **kwargs) -> requests.Response:
     """POST su endpoint protetto. Un 401 viene rifiutato dall'auth PRIMA che il
-    server crei alcunché, quindi rinfrescare e riprovare una volta è sicuro e
-    non genera prenotazioni duplicate."""
+    server crei alcunché, quindi rinfrescare e riprovare è sicuro e non genera
+    prenotazioni duplicate.
+
+    Due tipi di 401:
+      - `unauthorized.too_fast`: il portale rifiuta i POST troppo ravvicinati
+        all'emissione del token guest (anti-bot). Il token È valido: NON va
+        rigenerato (azzererebbe la sua età); lo si lascia invecchiare con un
+        backoff e si riprova lo stesso POST.
+      - 401 "normale": token scaduto/non valido -> rigenera e riprova una volta.
+    """
     _ensure_guest_token(session)
     r = session.post(url, **kwargs)
-    if r.status_code == 401:
-        _ensure_guest_token(session, force=True)
-        r = session.post(url, **kwargs)
-    return r
+    if r.status_code != 401:
+        return r
+    if "too_fast" in r.text:
+        for delay in _STORE_RETRY_DELAYS:
+            time.sleep(delay)
+            r = session.post(url, **kwargs)
+            if r.status_code != 401 or "too_fast" not in r.text:
+                break
+        return r
+    _ensure_guest_token(session, force=True)
+    return session.post(url, **kwargs)
 
 
 # ---------- core API ----------
