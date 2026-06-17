@@ -1,0 +1,23 @@
+name: Deploy
+
+# Ad ogni push su main: il runner self-hosted sul server allinea il repo a
+# origin/main e ricostruisce il container. .env e data/ sono in .gitignore,
+# quindi il reset --hard non li tocca.
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    steps:
+      - name: Pull e riavvia il container
+        working-directory: /home/factorio/AutomaticMozzoLibrary
+        run: |
+          git fetch --prune origin
+          git reset --hard origin/main
+          docker compose up -d --build
