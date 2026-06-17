@@ -194,6 +194,19 @@ def slot_giorno(session: requests.Session, giorno: date, area_id: int) -> dict[s
     return day if isinstance(day, dict) else {}
 
 
+def slot_gia_iniziato(giorno: date, inizio_hhmm: str, ref: datetime | None = None) -> bool:
+    """True se la fascia che inizia a `inizio_hhmm` del `giorno` è già iniziata.
+
+    Il portale accetta prenotazioni su fasce già iniziate ma poi non ne consente
+    la cancellazione: vanno quindi bloccate a monte.
+    """
+    ref = ref or datetime.now(TZ)
+    start_dt = datetime.combine(
+        giorno, datetime.strptime(inizio_hhmm, "%H:%M").time(), tzinfo=TZ
+    )
+    return start_dt <= ref
+
+
 def prenota_e_conferma(
     session: requests.Session,
     giorno: date,
@@ -217,6 +230,9 @@ def prenota_e_conferma(
     )
     end_dt = start_dt + timedelta(seconds=DURATA_SECONDI)
     slot_key = f"{inizio_hhmm}-{end_dt.strftime('%H:%M')}"
+
+    if start_dt <= datetime.now(TZ):
+        return {"ok": False, "slot": slot_key, "errore": f"Slot {slot_key} già iniziato: non prenotabile"}
 
     slots = slot_giorno(session, giorno, area_id)
     info = slots.get(slot_key)

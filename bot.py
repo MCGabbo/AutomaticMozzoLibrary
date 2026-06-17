@@ -48,6 +48,7 @@ from book import (
     cancella_prenotazione,
     prenota_e_conferma,
     slot_giorno,
+    slot_gia_iniziato,
 )
 
 for _stream in (sys.stdout, sys.stderr):
@@ -166,6 +167,11 @@ def kb_back(target: str) -> list[InlineKeyboardButton]:
 
 # ---------- API wrappers (chiamati da to_thread) ----------
 
+def _slots_prenotabili(giorno: date, slots: dict) -> dict:
+    """Scarta le fasce già iniziate: il portale non ne consente la cancellazione."""
+    return {k: v for k, v in slots.items() if not slot_gia_iniziato(giorno, k.split("-")[0])}
+
+
 async def _giorni_con_disponibilita(session, area_id: int) -> list[tuple[date, dict]]:
     """Fetcha i 7 giorni in parallelo. Salta giorni con errore/vuoti."""
     today = datetime.now(TZ).date()
@@ -179,13 +185,14 @@ async def _giorni_con_disponibilita(session, area_id: int) -> list[tuple[date, d
         if isinstance(slots, Exception):
             log.warning("slot %s area %s: %s", d, area_id, slots)
             continue
+        slots = _slots_prenotabili(d, slots)
         if any(s["disponibili"] > 0 for s in slots.values()):
             out.append((d, slots))
     return out
 
 
 def _fasce_disponibili(session, area_id: int, giorno: date) -> dict[str, dict]:
-    return slot_giorno(session, giorno, area_id)
+    return _slots_prenotabili(giorno, slot_giorno(session, giorno, area_id))
 
 
 # ---------- comandi base ----------
