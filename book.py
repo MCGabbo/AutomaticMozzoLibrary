@@ -179,12 +179,16 @@ def lista_aree(session: requests.Session) -> list[dict]:
     return r.json()["aree"]
 
 
-def slot_giorno(session: requests.Session, giorno: date, area_id: int) -> dict[str, dict]:
+def slot_giorno(
+    session: requests.Session, giorno: date, area_id: int, durata: int = DURATA_SECONDI
+) -> dict[str, dict]:
     """Mappa 'HH:MM-HH:MM' -> {'disponibili': n, 'su': n, 'reserved': bool}.
 
-    Ritorna dict vuoto se il giorno è chiuso o non disponibile.
+    `durata` (secondi) determina gli slot restituiti dal portale: orari di
+    inizio a passi di 30 min e fine = inizio + durata. Ritorna dict vuoto se
+    il giorno è chiuso o non disponibile.
     """
-    url = f"{BASE}/api/entry/{ENTRY_TYPE}/schedule/{giorno.isoformat()}/{area_id}/{DURATA_SECONDI}"
+    url = f"{BASE}/api/entry/{ENTRY_TYPE}/schedule/{giorno.isoformat()}/{area_id}/{durata}"
     r = _authed_get(session, url)
     r.raise_for_status()
     sched = r.json().get("schedule", {})
@@ -214,11 +218,13 @@ def prenota_e_conferma(
     area_id: int,
     utente: dict,
     cognome_nome: str,
+    durata: int = DURATA_SECONDI,
     dry_run: bool = False,
 ) -> dict:
     """Esegue store + confirm. Ritorna dict con esito.
 
     utente = {'codice_fiscale': ..., 'email': ..., 'phone': ...}
+    `durata` in secondi (default 3h).
 
     Ritorna:
         {'ok': True, 'codice': str, 'entry': int, 'postazione': str, 'slot': str}
@@ -228,13 +234,13 @@ def prenota_e_conferma(
     start_dt = datetime.combine(
         giorno, datetime.strptime(inizio_hhmm, "%H:%M").time(), tzinfo=TZ
     )
-    end_dt = start_dt + timedelta(seconds=DURATA_SECONDI)
+    end_dt = start_dt + timedelta(seconds=durata)
     slot_key = f"{inizio_hhmm}-{end_dt.strftime('%H:%M')}"
 
     if start_dt <= datetime.now(TZ):
         return {"ok": False, "slot": slot_key, "errore": f"Slot {slot_key} già iniziato: non prenotabile"}
 
-    slots = slot_giorno(session, giorno, area_id)
+    slots = slot_giorno(session, giorno, area_id, durata)
     info = slots.get(slot_key)
     if not info:
         return {"ok": False, "slot": slot_key, "errore": f"Slot {slot_key} inesistente"}
@@ -246,7 +252,7 @@ def prenota_e_conferma(
         "cliente": CLIENTE_SLUG,
         "start_time": int(start_dt.timestamp()),
         "end_time": int(end_dt.timestamp()),
-        "durata": str(DURATA_SECONDI),
+        "durata": str(durata),
         "entry_type": ENTRY_TYPE,
         "area": area_id,
         "public_primary": utente["codice_fiscale"],

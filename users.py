@@ -92,6 +92,17 @@ def init_db() -> None:
         c.execute(
             "CREATE INDEX IF NOT EXISTS idx_prenotazioni_chat ON prenotazioni(chat_id)"
         )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS preferenze (
+                chat_id INTEGER PRIMARY KEY,
+                mattina_inizio TEXT NOT NULL DEFAULT '09:30',
+                pomeriggio_inizio TEXT NOT NULL DEFAULT '14:30',
+                quick_area INTEGER NOT NULL DEFAULT 67,
+                quick_slot TEXT NOT NULL DEFAULT 'mattina'
+            )
+            """
+        )
 
 
 def _conn() -> sqlite3.Connection:
@@ -262,6 +273,48 @@ def mark_cancelled(codice: str) -> bool:
             (codice,),
         )
     return cur.rowcount > 0
+
+
+# ---------- preferenze ----------
+
+@dataclass
+class Prefs:
+    mattina_inizio: str = "09:30"
+    pomeriggio_inizio: str = "14:30"
+    quick_area: int = 67
+    quick_slot: str = "mattina"
+
+
+_PREF_FIELDS = {
+    "mattina_inizio", "pomeriggio_inizio", "quick_area", "quick_slot",
+}
+
+
+def get_prefs(chat_id: int) -> Prefs:
+    """Preferenze dell'utente, o i default se non ne ha ancora salvate."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT * FROM preferenze WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+    if not row:
+        return Prefs()
+    d = dict(row)
+    d.pop("chat_id")
+    return Prefs(**d)
+
+
+def set_pref(chat_id: int, field: str, value) -> None:
+    """Aggiorna un singolo campo delle preferenze (upsert)."""
+    if field not in _PREF_FIELDS:
+        raise ValueError(f"Campo preferenza sconosciuto: {field}")
+    with _conn() as c:
+        c.execute(
+            f"""
+            INSERT INTO preferenze (chat_id, {field}) VALUES (?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET {field}=excluded.{field}
+            """,
+            (chat_id, value),
+        )
 
 
 # ---------- payload utenti ----------
