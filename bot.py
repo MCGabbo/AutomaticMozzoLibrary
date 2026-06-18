@@ -8,6 +8,7 @@ Comandi utente:
     /prenota            wizard di prenotazione
     /domattina          shortcut: mattina al Piano 1 di domani
     /slot               disponibilità prossimi giorni
+    /settings           preferenze orari di inizio e prenotazione rapida
 
 Comandi admin (solo TELEGRAM_ADMIN_CHAT_IDS):
     /admin_utenti       lista utenti registrati con stato
@@ -69,10 +70,14 @@ SEDI = [
     (67, "Posto Studio 1° Piano"),
     (71, "Zona Narrativa"),
 ]
-FASCE = [
-    ("09:30", "Mattina (9:30-12:30)"),
-    ("14:30", "Pomeriggio (14:30-17:30)"),
-]
+SLOT_NOMI = {"mattina": "Mattina", "pomeriggio": "Pomeriggio"}
+# Orario di fine fisso di ciascun blocco: l'utente sceglie solo l'inizio.
+BLOCK_END = {"mattina": "12:30", "pomeriggio": "17:30"}
+# Orari di inizio selezionabili (passi di 30 min), fino all'ultimo slot da 30 min.
+START_OPZIONI = {
+    "mattina": ["09:30", "10:00", "10:30", "11:00", "11:30", "12:00"],
+    "pomeriggio": ["14:30", "15:00", "15:30", "16:00", "16:30", "17:00"],
+}
 GIORNI_BREVE = ["Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"]
 MAX_GIORNI_AVANTI = 7
 
@@ -139,19 +144,38 @@ def nome_sede(area_id: int) -> str:
     return f"sede {area_id}"
 
 
-def label_fascia(hhmm: str) -> str:
-    for h, nome in FASCE:
-        if h == hhmm:
-            return nome
-    return hhmm
+def _durata(nome: str, inizio: str) -> int:
+    """Secondi tra l'inizio scelto e la fine fissa del blocco."""
+    fine = datetime.strptime(BLOCK_END[nome], "%H:%M")
+    return int((fine - datetime.strptime(inizio, "%H:%M")).total_seconds())
+
+
+def _slot_key(inizio: str, nome: str) -> str:
+    return f"{inizio}-{BLOCK_END[nome]}"
+
+
+def _fascia_di(prefs: users.Prefs, nome: str) -> tuple[str, int]:
+    """(inizio, durata) della fascia richiesta secondo le preferenze."""
+    inizio = prefs.mattina_inizio if nome == "mattina" else prefs.pomeriggio_inizio
+    return inizio, _durata(nome, inizio)
+
+
+def _user_fasce(prefs: users.Prefs) -> list[tuple[str, str, int]]:
+    """[(nome, inizio, durata)] per le due fasce configurate dall'utente."""
+    return [(nome, *_fascia_di(prefs, nome)) for nome in ("mattina", "pomeriggio")]
+
+
+def label_fascia(nome: str, inizio: str) -> str:
+    return f"{SLOT_NOMI[nome]} ({inizio}-{BLOCK_END[nome]})"
 
 
 def kb_home() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚡ Domattina, Piano 1", callback_data="quick:domattina-piano1")],
+        [InlineKeyboardButton("⚡ Prenotazione rapida", callback_data="quick:run")],
         [InlineKeyboardButton("📅 Nuova prenotazione", callback_data="wiz:sede")],
         [InlineKeyboardButton("🔍 Slot disponibili", callback_data="slot:home")],
         [InlineKeyboardButton("🗑️ Annulla prenotazione", callback_data="cancel:lista")],
+        [InlineKeyboardButton("⚙️ Preferenze", callback_data="set:home")],
     ])
 
 
@@ -165,34 +189,128 @@ def kb_back(target: str) -> list[InlineKeyboardButton]:
     return [InlineKeyboardButton("⬅️ Indietro", callback_data=target)]
 
 
+# ---------- GUI preferenze ----------
+
+def _fascia_riepilogo(prefs: users.Prefs, nome: str) -> str:
+    return f"{getattr(prefs, f'{nome}_inizio')}-{BLOCK_END[nome]}"
+
+
+def kb_settings(prefs: users.Prefs) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"🌅 Mattina: {_fascia_riepilogo(prefs, 'mattina')}",
+            callback_data="set:fascia:mattina")],
+        [InlineKeyboardButton(
+            f"🌇 Pomeriggio: {_fascia_riepilogo(prefs, 'pomeriggio')}",
+            callback_data="set:fascia:pomeriggio")],
+        [InlineKeyboardButton(
+            f"⚡ Rapida: {nome_sede(prefs.quick_area)} · {SLOT_NOMI[prefs.quick_slot]}",
+            callback_data="set:quick")],
+        [InlineKeyboardButton("⬅️ Home", callback_data="home")],
+    ])
+
+
+def kb_fascia_edit(prefs: users.Prefs, nome: str) -> InlineKeyboardMarkup:
+    inizio = getattr(prefs, f"{nome}_inizio")
+    rows = [[InlineKeyboardButton("— Orario di inizio —", callback_data="noop")]]
+    rows += _grid(
+        [(f"✓ {s}", "noop") if s == inizio else (s, f"set:start:{nome}:{s}")
+         for s in START_OPZIONI[nome]],
+        cols=3,
+    )
+    rows.append([InlineKeyboardButton("⬅️ Preferenze", callback_data="set:home")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_quick_edit(prefs: users.Prefs) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("— Sede —", callback_data="noop")]]
+    for aid, nm in SEDI:
+        sel = aid == prefs.quick_area
+        rows.append([InlineKeyboardButton(
+            f"✓ {nm}" if sel else nm, callback_data="noop" if sel else f"set:qarea:{aid}")])
+    rows.append([InlineKeyboardButton("— Slot —", callback_data="noop")])
+    for key in ("mattina", "pomeriggio"):
+        sel = prefs.quick_slot == key
+        rows.append([InlineKeyboardButton(
+            f"✓ {SLOT_NOMI[key]}" if sel else SLOT_NOMI[key],
+            callback_data="noop" if sel else f"set:qslot:{key}")])
+    rows.append([InlineKeyboardButton("⬅️ Preferenze", callback_data="set:home")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _grid(items: list[tuple[str, str]], cols: int) -> list[list[InlineKeyboardButton]]:
+    rows, row = [], []
+    for label, cb in items:
+        row.append(InlineKeyboardButton(label, callback_data=cb))
+        if len(row) == cols:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return rows
+
+
+SETTINGS_TXT = (
+    "⚙️ *Preferenze*\n\n"
+    "Imposta l'orario di inizio preferito per la fascia mattina (fine 12:30) e "
+    "pomeriggio (fine 17:30), e la sede/slot della prenotazione rapida ⚡.\n"
+    "Le scelte vengono usate dal wizard, dalla scorciatoia e da /domattina."
+)
+
+
 # ---------- API wrappers (chiamati da to_thread) ----------
 
-def _slots_prenotabili(giorno: date, slots: dict) -> dict:
-    """Scarta le fasce già iniziate: il portale non ne consente la cancellazione."""
-    return {k: v for k, v in slots.items() if not slot_gia_iniziato(giorno, k.split("-")[0])}
+async def _disponibilita_giorni(
+    session, area_id: int, prefs: users.Prefs
+) -> list[tuple[date, dict]]:
+    """Per i prossimi 7 giorni ritorna (data, {nome_fascia: info|None}).
 
-
-async def _giorni_con_disponibilita(session, area_id: int) -> list[tuple[date, dict]]:
-    """Fetcha i 7 giorni in parallelo. Salta giorni con errore/vuoti."""
+    Usa l'orario e la durata configurati dall'utente per ciascuna fascia.
+    Fetcha in parallelo una schedule per ogni durata distinta. Salta i giorni
+    senza alcuna fascia libera e le fasce già iniziate.
+    """
     today = datetime.now(TZ).date()
     days = [today + timedelta(days=off) for off in range(MAX_GIORNI_AVANTI)]
+    fasce = _user_fasce(prefs)
+    durate = list({durata for _, _, durata in fasce})
+    jobs = [(durata, d) for durata in durate for d in days]
     results = await asyncio.gather(
-        *(asyncio.to_thread(slot_giorno, session, d, area_id) for d in days),
+        *(asyncio.to_thread(slot_giorno, session, d, area_id, durata) for durata, d in jobs),
         return_exceptions=True,
     )
+    sched: dict[tuple[int, date], dict] = {}
+    for (durata, d), res in zip(jobs, results):
+        if isinstance(res, Exception):
+            log.warning("slot %s area %s dur %s: %s", d, area_id, durata, res)
+            res = {}
+        sched[(durata, d)] = res
     out = []
-    for d, slots in zip(days, results):
-        if isinstance(slots, Exception):
-            log.warning("slot %s area %s: %s", d, area_id, slots)
-            continue
-        slots = _slots_prenotabili(d, slots)
-        if any(s["disponibili"] > 0 for s in slots.values()):
-            out.append((d, slots))
+    for d in days:
+        info: dict[str, dict | None] = {}
+        for nome, inizio, durata in fasce:
+            if slot_gia_iniziato(d, inizio):
+                info[nome] = None
+                continue
+            s = sched.get((durata, d), {}).get(_slot_key(inizio, nome))
+            info[nome] = s if (s and s["disponibili"] > 0) else None
+        if any(info.values()):
+            out.append((d, info))
     return out
 
 
-def _fasce_disponibili(session, area_id: int, giorno: date) -> dict[str, dict]:
-    return _slots_prenotabili(giorno, slot_giorno(session, giorno, area_id))
+def _fasce_disponibili(session, area_id: int, giorno: date, prefs: users.Prefs) -> dict[str, dict | None]:
+    """{nome_fascia: info|None} per un singolo giorno, secondo le preferenze."""
+    cache: dict[int, dict] = {}
+    out: dict[str, dict | None] = {}
+    for nome, inizio, durata in _user_fasce(prefs):
+        if slot_gia_iniziato(giorno, inizio):
+            out[nome] = None
+            continue
+        if durata not in cache:
+            cache[durata] = slot_giorno(session, giorno, area_id, durata)
+        s = cache[durata].get(_slot_key(inizio, nome))
+        out[nome] = s if (s and s["disponibili"] > 0) else None
+    return out
 
 
 # ---------- comandi base ----------
@@ -226,14 +344,25 @@ async def cmd_prenota(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_domattina(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await guard(update, context):
         return
+    prefs = users.get_prefs(update.effective_chat.id)
+    inizio, durata = _fascia_di(prefs, "mattina")
     giorno = datetime.now(TZ).date() + timedelta(days=1)
-    await _avvia_quick(update, context, area_id=67, fascia="09:30", giorno=giorno)
+    await _avvia_quick(update, context, 67, inizio, durata, "mattina", giorno)
 
 
 async def cmd_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await guard(update, context):
         return
     await _mostra_slot_overview(update.message, context)
+
+
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await guard(update, context):
+        return
+    prefs = users.get_prefs(update.effective_chat.id)
+    await update.message.reply_text(
+        SETTINGS_TXT, reply_markup=kb_settings(prefs), parse_mode="Markdown"
+    )
 
 
 async def cmd_annulla(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -552,13 +681,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("wiz:riepilogo:"):
-        _, _, area_id_s, iso, hhmm = data.split(":", 4)
+        _, _, area_id_s, iso, nome = data.split(":", 4)
         area_id = int(area_id_s)
         giorno = date.fromisoformat(iso)
+        prefs = users.get_prefs(q.from_user.id)
+        inizio, durata = _fascia_di(prefs, nome)
         context.user_data["area_id"] = area_id
         context.user_data["giorno"] = iso
-        context.user_data["fascia"] = hhmm
-        await _mostra_riepilogo(q, context, area_id, giorno, hhmm)
+        context.user_data["fascia"] = inizio
+        context.user_data["durata"] = durata
+        context.user_data["fascia_nome"] = nome
+        await _mostra_riepilogo(q, context, area_id, giorno, nome, inizio)
         return
 
     if data == "wiz:confirm":
@@ -569,9 +702,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Annullato.", reply_markup=kb_home())
         return
 
-    if data == "quick:domattina-piano1":
+    if data == "quick:run":
+        prefs = users.get_prefs(q.from_user.id)
+        nome = prefs.quick_slot
+        inizio, durata = _fascia_di(prefs, nome)
         giorno = datetime.now(TZ).date() + timedelta(days=1)
-        await _avvia_quick(update, context, area_id=67, fascia="09:30", giorno=giorno)
+        await _avvia_quick(update, context, prefs.quick_area, inizio, durata, nome, giorno)
+        return
+
+    if data == "noop":
+        return
+
+    if data.startswith("set:"):
+        await _on_settings_callback(q, context, data)
         return
 
     if data == "slot:home":
@@ -600,7 +743,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _mostra_giorni(q, context, area_id: int):
     await q.edit_message_text(f"Caricamento giorni disponibili per {nome_sede(area_id)}...")
     session = context.application.bot_data["session"]
-    giorni = await _giorni_con_disponibilita(session, area_id)
+    prefs = users.get_prefs(q.from_user.id)
+    giorni = await _disponibilita_giorni(session, area_id, prefs)
     if not giorni:
         await q.edit_message_text(
             f"Nessun giorno con slot liberi nei prossimi {MAX_GIORNI_AVANTI} giorni.",
@@ -608,11 +752,11 @@ async def _mostra_giorni(q, context, area_id: int):
         )
         return
     rows = []
-    for d, slots in giorni:
-        mattina = slots.get("09:30-12:30")
-        pom = slots.get("14:30-17:30")
-        badge_m = f"M:{mattina['disponibili']}" if mattina and mattina["disponibili"] > 0 else "--"
-        badge_p = f"P:{pom['disponibili']}" if pom and pom["disponibili"] > 0 else "--"
+    for d, info in giorni:
+        mattina = info.get("mattina")
+        pom = info.get("pomeriggio")
+        badge_m = f"M:{mattina['disponibili']}" if mattina else "--"
+        badge_p = f"P:{pom['disponibili']}" if pom else "--"
         rows.append([InlineKeyboardButton(
             f"{label_giorno(d)}  ({badge_m} {badge_p})",
             callback_data=f"wiz:fascia:{area_id}:{d.isoformat()}",
@@ -627,19 +771,19 @@ async def _mostra_giorni(q, context, area_id: int):
 async def _mostra_fasce(q, context, area_id: int, giorno: date):
     await q.edit_message_text("Caricamento fasce...")
     session = context.application.bot_data["session"]
-    slots = await asyncio.to_thread(_fasce_disponibili, session, area_id, giorno)
+    prefs = users.get_prefs(q.from_user.id)
+    fasce_info = await asyncio.to_thread(_fasce_disponibili, session, area_id, giorno, prefs)
     rows = []
-    for hhmm, etichetta in FASCE:
-        end_h = (datetime.strptime(hhmm, "%H:%M") + timedelta(hours=3)).strftime("%H:%M")
-        info = slots.get(f"{hhmm}-{end_h}")
-        if not info or info["disponibili"] == 0:
+    for nome, inizio, _durata_s in _user_fasce(prefs):
+        info = fasce_info.get(nome)
+        if not info:
             continue
         rows.append([InlineKeyboardButton(
-            f"{etichetta} — {info['disponibili']}/{info['su']} liberi",
-            callback_data=f"wiz:riepilogo:{area_id}:{giorno.isoformat()}:{hhmm}",
+            f"{label_fascia(nome, inizio)} — {info['disponibili']}/{info['su']} liberi",
+            callback_data=f"wiz:riepilogo:{area_id}:{giorno.isoformat()}:{nome}",
         )])
     if not rows:
-        rows.append([InlineKeyboardButton("(nessuna fascia 3h libera)", callback_data="noop")])
+        rows.append([InlineKeyboardButton("(nessuna fascia libera)", callback_data="noop")])
     rows.append(kb_back(f"wiz:giorno:{area_id}"))
     await q.edit_message_text(
         f"Sede: {nome_sede(area_id)}\nGiorno: {label_giorno(giorno)} ({giorno.isoformat()})\nFascia:",
@@ -647,12 +791,12 @@ async def _mostra_fasce(q, context, area_id: int, giorno: date):
     )
 
 
-async def _mostra_riepilogo(q, context, area_id: int, giorno: date, hhmm: str):
+async def _mostra_riepilogo(q, context, area_id: int, giorno: date, nome: str, inizio: str):
     testo = (
         "Stai per prenotare:\n\n"
         f"📍 Sede: {nome_sede(area_id)}\n"
         f"📅 Giorno: {label_giorno(giorno)} ({giorno.isoformat()})\n"
-        f"🕐 Fascia: {label_fascia(hhmm)}\n\n"
+        f"🕐 Fascia: {label_fascia(nome, inizio)}\n\n"
         "Confermi?"
     )
     rows = [[
@@ -666,7 +810,8 @@ async def _esegui_prenotazione(q, context):
     area_id = context.user_data.get("area_id")
     iso = context.user_data.get("giorno")
     hhmm = context.user_data.get("fascia")
-    if not (area_id and iso and hhmm):
+    durata = context.user_data.get("durata")
+    if not (area_id and iso and hhmm and durata):
         await q.edit_message_text("Stato perso. Ricomincia con /prenota.", reply_markup=kb_home())
         return
     giorno = date.fromisoformat(iso)
@@ -680,7 +825,7 @@ async def _esegui_prenotazione(q, context):
     await q.edit_message_text("Prenoto...")
     session = context.application.bot_data["session"]
     res = await asyncio.to_thread(
-        prenota_e_conferma, session, giorno, hhmm, area_id, utente, cognome_nome, False
+        prenota_e_conferma, session, giorno, hhmm, area_id, utente, cognome_nome, durata, False
     )
     if not res["ok"]:
         await q.edit_message_text(f"❌ Errore: {res['errore']}", reply_markup=kb_home())
@@ -707,21 +852,25 @@ async def _esegui_prenotazione(q, context):
         f"🎫 Codice: {res['codice']}"
     )
     await q.edit_message_text(testo, reply_markup=kb_home())
-    for k in ("area_id", "giorno", "fascia"):
+    for k in ("area_id", "giorno", "fascia", "durata", "fascia_nome"):
         context.user_data.pop(k, None)
 
 
 # ---------- shortcut domattina ----------
 
-async def _avvia_quick(update: Update, context: ContextTypes.DEFAULT_TYPE, area_id: int, fascia: str, giorno: date):
+async def _avvia_quick(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+    area_id: int, inizio: str, durata: int, nome: str, giorno: date,
+):
     context.user_data["area_id"] = area_id
     context.user_data["giorno"] = giorno.isoformat()
-    context.user_data["fascia"] = fascia
+    context.user_data["fascia"] = inizio
+    context.user_data["durata"] = durata
+    context.user_data["fascia_nome"] = nome
 
-    end_h = (datetime.strptime(fascia, "%H:%M") + timedelta(hours=3)).strftime("%H:%M")
-    slot_key = f"{fascia}-{end_h}"
+    slot_key = _slot_key(inizio, nome)
     session = context.application.bot_data["session"]
-    slots = await asyncio.to_thread(slot_giorno, session, giorno, area_id)
+    slots = await asyncio.to_thread(slot_giorno, session, giorno, area_id, durata)
     info = slots.get(slot_key)
     if not info or info["disponibili"] == 0:
         msg = f"❌ Slot {slot_key} non disponibile per {label_giorno(giorno)} a {nome_sede(area_id)}."
@@ -735,7 +884,7 @@ async def _avvia_quick(update: Update, context: ContextTypes.DEFAULT_TYPE, area_
         f"⚡ Scorciatoia\n\n"
         f"📍 {nome_sede(area_id)}\n"
         f"📅 {label_giorno(giorno)} ({giorno.isoformat()})\n"
-        f"🕐 {label_fascia(fascia)} — {info['disponibili']}/{info['su']} liberi\n\n"
+        f"🕐 {label_fascia(nome, inizio)} — {info['disponibili']}/{info['su']} liberi\n\n"
         "Confermi?"
     )
     markup = InlineKeyboardMarkup([[
@@ -843,13 +992,65 @@ async def _esegui_cancellazione(q, context, codice: str):
     )
 
 
+# ---------- callback preferenze ----------
+
+async def _on_settings_callback(q, context, data: str):
+    """Gestisce tutti i callback `set:*` della sezione preferenze."""
+    chat_id = q.from_user.id
+
+    if data == "set:home":
+        prefs = users.get_prefs(chat_id)
+        await q.edit_message_text(SETTINGS_TXT, reply_markup=kb_settings(prefs), parse_mode="Markdown")
+        return
+
+    if data.startswith("set:fascia:"):
+        nome = data.split(":", 2)[2]
+        prefs = users.get_prefs(chat_id)
+        await q.edit_message_text(
+            f"🕐 *{SLOT_NOMI[nome]}* — scegli l'orario di inizio "
+            f"(la fascia termina sempre alle {BLOCK_END[nome]}).",
+            reply_markup=kb_fascia_edit(prefs, nome),
+            parse_mode="Markdown",
+        )
+        return
+
+    if data == "set:quick":
+        prefs = users.get_prefs(chat_id)
+        await q.edit_message_text(
+            "⚡ *Prenotazione rapida* — scegli sede e slot. "
+            "Userà l'orario della fascia scelta, per domani.",
+            reply_markup=kb_quick_edit(prefs),
+            parse_mode="Markdown",
+        )
+        return
+
+    if data.startswith("set:start:"):
+        _, _, nome, val = data.split(":", 3)
+        users.set_pref(chat_id, f"{nome}_inizio", val)
+        await q.edit_message_reply_markup(reply_markup=kb_fascia_edit(users.get_prefs(chat_id), nome))
+        return
+
+    if data.startswith("set:qarea:"):
+        users.set_pref(chat_id, "quick_area", int(data.split(":", 2)[2]))
+        await q.edit_message_reply_markup(reply_markup=kb_quick_edit(users.get_prefs(chat_id)))
+        return
+
+    if data.startswith("set:qslot:"):
+        users.set_pref(chat_id, "quick_slot", data.split(":", 2)[2])
+        await q.edit_message_reply_markup(reply_markup=kb_quick_edit(users.get_prefs(chat_id)))
+        return
+
+    log.warning("Callback preferenze sconosciuta: %r", data)
+
+
 # ---------- overview slot ----------
 
 async def _mostra_slot_overview(target, context, edit: bool = False):
     session = context.application.bot_data["session"]
-    # Tutte le 14 GET (2 sedi × 7 giorni) in parallelo
+    prefs = users.get_prefs(target.chat.id)
+    # Tutte le GET (2 sedi × 7 giorni × durate distinte) in parallelo
     sedi_giorni = await asyncio.gather(
-        *(_giorni_con_disponibilita(session, area_id) for area_id, _ in SEDI)
+        *(_disponibilita_giorni(session, area_id, prefs) for area_id, _ in SEDI)
     )
     righe = []
     for (area_id, nome), giorni in zip(SEDI, sedi_giorni):
@@ -857,9 +1058,9 @@ async def _mostra_slot_overview(target, context, edit: bool = False):
         if not giorni:
             righe.append("  (nessuno slot libero)")
             continue
-        for d, slots in giorni:
-            m = slots.get("09:30-12:30")
-            p = slots.get("14:30-17:30")
+        for d, info in giorni:
+            m = info.get("mattina")
+            p = info.get("pomeriggio")
             badge_m = f"M {m['disponibili']}/{m['su']}" if m else "--"
             badge_p = f"P {p['disponibili']}/{p['su']}" if p else "--"
             righe.append(f"  {label_giorno(d)} ({d.isoformat()}): {badge_m}  {badge_p}")
@@ -917,6 +1118,7 @@ async def _post_init(app: Application):
         BotCommand("domattina", "Prenota domattina al Piano 1"),
         BotCommand("annulla", "Annulla una prenotazione esistente"),
         BotCommand("slot", "Disponibilità prossimi giorni"),
+        BotCommand("settings", "Preferenze orari di inizio e prenotazione rapida"),
         BotCommand("profilo", "Vedi il tuo profilo"),
         BotCommand("registra", "Registra il tuo profilo"),
         BotCommand("cancella_profilo", "Elimina i tuoi dati dal bot"),
@@ -961,6 +1163,7 @@ def main() -> int:
     app.add_handler(CommandHandler("prenota", cmd_prenota))
     app.add_handler(CommandHandler("domattina", cmd_domattina))
     app.add_handler(CommandHandler("slot", cmd_slot))
+    app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("annulla", cmd_annulla))
     app.add_handler(CommandHandler("profilo", cmd_profilo))
     app.add_handler(CommandHandler("cancella_profilo", cmd_cancella_profilo))

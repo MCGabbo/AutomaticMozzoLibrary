@@ -15,7 +15,11 @@ approvazione dall'admin.
 - **Prenotazione a bottoni inline**: `Sede → Giorno → Fascia → Conferma`,
   niente da digitare. Lo schermo si aggiorna ad ogni passo (non spamma
   messaggi nuovi).
-- **Scorciatoia 1-tap** "Domattina, Piano 1" per il caso d'uso più frequente.
+- **Scorciatoia 1-tap** "Prenotazione rapida" per il caso d'uso più frequente,
+  configurabile (sede e slot) da `/settings`.
+- **Preferenze personalizzabili** (`/settings`): orario di inizio preferito
+  per la fascia mattina (fine fissa 12:30) e pomeriggio (fine fissa 17:30),
+  ricordati per ogni utente e usati da wizard, scorciatoia e `/domattina`.
 - **Disponibilità in tempo reale**: prima di mostrarti un giorno o una fascia,
   il bot chiede al portale quanti posti sono ancora liberi e mostra
   contatori tipo `M 12/18  P 18/18` (mattina/pomeriggio).
@@ -140,9 +144,10 @@ puoi anche rimuoverli, il bot vive solo del DB.
 | `/profilo` | Mostra i propri dati e lo stato (in attesa / approvato) |
 | `/cancella_profilo` | Elimina i propri dati dal bot |
 | `/prenota` | Wizard prenotazione |
-| `/domattina` | Scorciatoia: domattina al Piano 1 |
+| `/domattina` | Scorciatoia: domattina al Piano 1 (orario/durata dalle preferenze) |
 | `/annulla` | Annulla una prenotazione esistente |
 | `/slot` | Disponibilità prossimi 7 giorni su entrambe le sedi |
+| `/settings` | Preferenze: orario di inizio per mattina (fine 12:30) e pomeriggio (fine 17:30), e sede/slot della prenotazione rapida ⚡ |
 
 ### Admin
 
@@ -154,10 +159,11 @@ puoi anche rimuoverli, il bot vive solo del DB.
 ### Schermata home
 
 ```
-  ⚡ Domattina, Piano 1
+  ⚡ Prenotazione rapida
   📅 Nuova prenotazione
   🔍 Slot disponibili
   🗑️ Annulla prenotazione
+  ⚙️ Preferenze
 ```
 
 ---
