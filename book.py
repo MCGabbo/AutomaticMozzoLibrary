@@ -77,8 +77,24 @@ class PrenotazioneError(Exception):
     """Errore atteso durante una prenotazione (slot esaurito, server in errore, ecc)."""
 
 
+# Timeout di default (connect, read) su OGNI richiesta. Senza, una connessione
+# che il portale accetta ma lascia muta (keep-alive idle chiusa a metà, blip di
+# rete) blocca il thread all'infinito: il peggio è dentro _ensure_guest_token,
+# che tiene _token_lock durante la GET, deadlockando tutte le operazioni portale
+# finché non si riavvia il processo.
+_HTTP_TIMEOUT = (5, 30)
+
+
+class _TimeoutSession(requests.Session):
+    """Session che applica _HTTP_TIMEOUT quando il chiamante non ne passa uno."""
+
+    def request(self, *args, **kwargs):
+        kwargs.setdefault("timeout", _HTTP_TIMEOUT)
+        return super().request(*args, **kwargs)
+
+
 def build_session() -> requests.Session:
-    s = requests.Session()
+    s = _TimeoutSession()
     # Retry trasparenti SOLO su GET/HEAD: il portale a volte chiude le
     # connessioni idle (RemoteDisconnected). I POST (store/confirm) NON
     # vengono ritentati per evitare prenotazioni duplicate.
